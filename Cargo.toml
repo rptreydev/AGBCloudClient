@@ -1,0 +1,42 @@
+[package]
+name = "agb-cloud-client"
+version = "0.1.0-beta"
+edition = "2024"
+description = "AGB Cloud Client — AGBroadband Desktop Sync Client"
+authors = ["AGBroadband"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "cookies", "multipart", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+keyring = { version = "3", features = ["windows-native", "linux-native"] }
+notify = "7"
+notify-debouncer-full = "0.4"
+sha2 = "0.10"
+walkdir = "2"
+open = "5"
+single-instance = "0.3"
+auto-launch = "0.5"
+eframe = "0.30"
+egui = "0.30"
+egui_extras = { version = "0.30", features = ["image"] }
+tray-icon = "0.19"
+rust_socketio = { version = "0.6", features = ["async"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rfd = "0.15"
+winapi = { version = "0.3", features = ["winuser", "shellapi", "fileapi", "minwindef"] }
+notify-rust = "4"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
