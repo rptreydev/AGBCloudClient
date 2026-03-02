@@ -20,8 +20,9 @@ struct SettingsApp {
     auto_start: bool,
     notifications_enabled: bool,
     roots: Vec<TreeNode>,
-    /// None value = selected but no policy chosen yet
     selected_policies: HashMap<String, Option<SyncPolicy>>,
+    /// UUIDs explicitly selected by the user (not auto-propagated to ancestors)
+    explicit_selections: std::collections::HashSet<String>,
     /// Names from config for displaying selections before/after tree loads
     config_names: Vec<(String, String, String)>, // (uuid, name, policy_label)
     is_loading: bool,
@@ -52,6 +53,11 @@ impl SettingsApp {
             .iter()
             .map(|f| (f.uuid.clone(), Some(f.policy.clone())))
             .collect();
+        let explicit_selections: std::collections::HashSet<String> = config
+            .selected_folders
+            .iter()
+            .map(|f| f.uuid.clone())
+            .collect();
         let config_names: Vec<(String, String, String)> = config
             .selected_folders
             .iter()
@@ -73,6 +79,7 @@ impl SettingsApp {
             notifications_enabled: config.notifications_enabled,
             roots: Vec::new(),
             selected_policies,
+            explicit_selections,
             config_names,
             is_loading: false,
             error_message: String::new(),
@@ -195,30 +202,35 @@ impl SettingsApp {
         for action in actions {
             match action {
                 TreeAction::Select(uuid) => {
+                    self.explicit_selections.insert(uuid.clone());
                     self.selected_policies.insert(uuid.clone(), Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
+                        self.explicit_selections.insert(d.clone());
                         self.selected_policies.entry(d).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
                     }
                     for a in find_ancestor_uuids(&self.roots, &uuid) {
-                        self.selected_policies.entry(a).or_insert(None);
+                        self.selected_policies.entry(a).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
                     }
                 }
                 TreeAction::Deselect(uuid) => {
                     self.selected_policies.remove(&uuid);
+                    self.explicit_selections.remove(&uuid);
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
                         self.selected_policies.remove(&d);
+                        self.explicit_selections.remove(&d);
                     }
                     let mut ancestors = find_ancestor_uuids(&self.roots, &uuid);
                     ancestors.reverse();
                     for a in ancestors {
-                        if matches!(self.selected_policies.get(&a), Some(None)) {
-                            if !has_selected_descendant(&self.roots, &a, &self.selected_policies) {
-                                self.selected_policies.remove(&a);
-                            }
+                        if !self.explicit_selections.contains(&a)
+                            && !has_selected_descendant(&self.roots, &a, &self.selected_policies)
+                        {
+                            self.selected_policies.remove(&a);
                         }
                     }
                 }
                 TreeAction::SetPolicy(uuid, policy) => {
+                    self.explicit_selections.insert(uuid.clone());
                     self.selected_policies.insert(uuid.clone(), Some(policy.clone()));
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
                         if self.selected_policies.contains_key(&d) {

@@ -625,7 +625,7 @@ pub fn create_desktop_shortcut(sync_folder: &str) -> anyhow::Result<()> {
         sync_folder.replace('\'', "''"),
         icon_loc.replace('\'', "''"),
     );
-    let output = std::process::Command::new(powershell_path())
+    let output = no_window_cmd(&powershell_path())
         .args(["-NoProfile", "-Command", &ps])
         .output()?;
     if !output.status.success() {
@@ -635,6 +635,21 @@ pub fn create_desktop_shortcut(sync_folder: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Create a Command that runs without a visible console window on Windows.
+#[cfg(target_os = "windows")]
+fn no_window_cmd(prog: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let mut cmd = std::process::Command::new(prog);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
+fn no_window_cmd(prog: &str) -> std::process::Command {
+    std::process::Command::new(prog)
+}
+
 fn reg_set(key: &str, name: Option<&str>, value: &str, reg_type: &str) -> anyhow::Result<()> {
     let mut args = vec!["add".to_string(), key.to_string()];
     match name {
@@ -642,7 +657,7 @@ fn reg_set(key: &str, name: Option<&str>, value: &str, reg_type: &str) -> anyhow
         None => args.push("/ve".to_string()),
     }
     args.extend(["/t".to_string(), reg_type.to_string(), "/d".to_string(), value.to_string(), "/f".to_string()]);
-    let output = std::process::Command::new("reg")
+    let output = no_window_cmd("reg")
         .args(&args)
         .output()?;
     if !output.status.success() {
@@ -653,7 +668,7 @@ fn reg_set(key: &str, name: Option<&str>, value: &str, reg_type: &str) -> anyhow
 
 fn reg_set_dword(key: &str, name: &str, value: u32) -> anyhow::Result<()> {
     let hex_val = format!("0x{value:x}");
-    let output = std::process::Command::new("reg")
+    let output = no_window_cmd("reg")
         .args(["add", key, "/v", name, "/t", "REG_DWORD", "/d", &hex_val, "/f"])
         .output()?;
     if !output.status.success() {
@@ -695,7 +710,7 @@ pub fn set_auto_start(enable: bool) -> anyhow::Result<()> {
         info!("Auto-start enabled: {exe_str}");
     } else {
         // Delete the registry value (ignore error if it doesn't exist)
-        let output = std::process::Command::new("reg")
+        let output = no_window_cmd("reg")
             .args(["delete", run_key, "/v", app_name, "/f"])
             .output()?;
         if output.status.success() {

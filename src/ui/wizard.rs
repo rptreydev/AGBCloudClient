@@ -83,6 +83,8 @@ struct WizardApp {
     // SelectFolders step
     roots: Vec<TreeNode>,
     selected_policies: HashMap<String, Option<SyncPolicy>>,
+    /// UUIDs explicitly selected by the user (not auto-propagated to ancestors)
+    explicit_selections: std::collections::HashSet<String>,
     tree_loading: bool,
     tree_error: String,
     tree_rx: Option<std::sync::mpsc::Receiver<FetchResult>>,
@@ -125,6 +127,7 @@ impl WizardApp {
             login_rx: None,
             roots: Vec::new(),
             selected_policies: HashMap::new(),
+            explicit_selections: std::collections::HashSet::new(),
             tree_loading: false,
             tree_error: String::new(),
             tree_rx: None,
@@ -338,35 +341,39 @@ impl WizardApp {
         for action in actions {
             match action {
                 TreeAction::Select(uuid) => {
-                    // Explicitly selected → always set policy (upgrades None ancestor markers)
+                    self.explicit_selections.insert(uuid.clone());
                     self.selected_policies.insert(uuid.clone(), Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
+                        self.explicit_selections.insert(d.clone());
                         self.selected_policies.entry(d).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
                     }
-                    // Mark ancestors as checked without policy (won't be synced)
+                    // Auto-select ancestors with default Sync policy (not added to explicit_selections)
                     for a in find_ancestor_uuids(&self.roots, &uuid) {
-                        self.selected_policies.entry(a).or_insert(None);
+                        self.selected_policies.entry(a).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
                     }
                 }
                 TreeAction::Deselect(uuid) => {
                     self.selected_policies.remove(&uuid);
+                    self.explicit_selections.remove(&uuid);
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
                         self.selected_policies.remove(&d);
+                        self.explicit_selections.remove(&d);
                     }
-                    // Clean up ancestor markers (bottom-up) when no more selected descendants
+                    // Clean up auto-selected ancestors (bottom-up) when no more selected descendants
                     let mut ancestors = find_ancestor_uuids(&self.roots, &uuid);
                     ancestors.reverse();
                     for a in ancestors {
-                        if matches!(self.selected_policies.get(&a), Some(None)) {
-                            if !has_selected_descendant(&self.roots, &a, &self.selected_policies) {
-                                self.selected_policies.remove(&a);
-                            }
+                        if !self.explicit_selections.contains(&a)
+                            && !has_selected_descendant(&self.roots, &a, &self.selected_policies)
+                        {
+                            self.selected_policies.remove(&a);
                         }
                     }
                 }
                 TreeAction::SetPolicy(uuid, policy) => {
+                    // Explicitly setting a policy promotes the node to explicit
+                    self.explicit_selections.insert(uuid.clone());
                     self.selected_policies.insert(uuid.clone(), Some(policy.clone()));
-                    // Propagate to all selected descendants
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
                         if self.selected_policies.contains_key(&d) {
                             self.selected_policies.insert(d, Some(policy.clone()));
