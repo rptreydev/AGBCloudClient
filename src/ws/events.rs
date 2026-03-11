@@ -1,6 +1,6 @@
 use anyhow::Result;
 use rust_socketio::asynchronous::ClientBuilder;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::auth::AuthState;
 use crate::config::AppConfig;

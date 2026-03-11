@@ -29,7 +29,7 @@ impl AuthState {
         let client = Client::builder()
             .danger_accept_invalid_certs(true) // Dev self-signed certs
             .cookie_store(true)
-            .user_agent("AGB Cloud Client Desktop")
+            .user_agent("AGB-Desktop Dart/0.1.0")
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .build()
@@ -46,56 +46,139 @@ impl AuthState {
         }
     }
 
-    /// Try to restore session from stored credentials
+    /// Try to restore session from stored credentials.
+    ///
+    /// Strategy:
+    /// 1. If a `refresh_token` is stored, call `/authentication/refresh` to get a
+    ///    fresh JWT (preferred — JWT may have expired).
+    /// 2. Fallback: if only a plain JWT is stored (e.g. right after a fresh login
+    ///    where the server didn't issue a refresh_token), use it directly.  The
+    ///    sync engine will detect expiry on the first API call and prompt re-login.
     pub async fn try_restore_session(&self) -> bool {
         let username = match CredentialStore::get_last_username() {
             Ok(Some(u)) => u,
             _ => return false,
         };
 
-        let refresh_token = match CredentialStore::get_refresh_token(&username) {
-            Ok(Some(t)) => t,
+        // ── Path 1: refresh_token available → hit the refresh endpoint ─────────
+        if let Ok(Some(refresh_token)) = CredentialStore::get_refresh_token(&username) {
+            info!("Attempting session restore via refresh token for: {username}");
+
+            let url = format!("{}/authentication/refresh", self.config.server_url);
+            let resp = match self.client
+                .post(&url)
+                .header("Cookie", format!("refresh_token={refresh_token}"))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Session restore (refresh) failed: {e}");
+                    // Don't return yet — fall through to JWT fallback below.
+                    return self.restore_from_stored_jwt(&username).await;
+                }
+            };
+
+            let status = resp.status();
+            let (jwt, new_refresh) = Self::extract_cookies(&resp);
+
+            if status.is_success() {
+                if let Some(token) = jwt {
+                    let mut inner = self.inner.write().await;
+                    inner.access_token = Some(token.clone());
+                    inner.is_authenticated = true;
+                    if let Err(e) = CredentialStore::store_token(&username, &token) {
+                        warn!("Failed to cache refreshed JWT (non-critical): {e}");
+                    }
+                    if let Some(rt) = new_refresh {
+                        if let Err(e) = CredentialStore::store_refresh_token(&username, &rt) {
+                            warn!("Failed to cache new refresh token (non-critical): {e}");
+                        }
+                    }
+                    info!("Session restored via refresh token for: {username}");
+                    return true;
+                }
+            }
+
+            let body = resp.text().await.unwrap_or_default();
+            warn!("Session restore (refresh) failed: HTTP {status} — {body}");
+            // Fall through to JWT fallback.
+        }
+
+        // ── Path 2: no refresh_token (e.g. fresh login) → use stored JWT ──────
+        if self.restore_from_stored_jwt(&username).await {
+            return true;
+        }
+
+        // ── Path 3: JWT also expired → auto-login with stored password ──────────
+        self.auto_login_with_stored_password(&username).await
+    }
+
+    /// Restore session using only a stored JWT (no refresh call).
+    /// Used as a fallback when no refresh_token is available.
+    async fn restore_from_stored_jwt(&self, username: &str) -> bool {
+        match CredentialStore::get_token(username) {
+            Ok(Some(token)) => {
+                let mut inner = self.inner.write().await;
+                inner.access_token = Some(token);
+                inner.is_authenticated = true;
+                info!("Session restored from stored JWT for: {username}");
+                true
+            }
+            _ => {
+                warn!("No stored JWT for: {username} — session restore failed");
+                false
+            }
+        }
+    }
+
+    /// Auto-login using stored password (Path 3).
+    /// Only used when both refresh_token and JWT paths fail.
+    /// Safe because the password is stored encrypted in the OS keychain (DPAPI).
+    async fn auto_login_with_stored_password(&self, username: &str) -> bool {
+        let password = match CredentialStore::get_password(username) {
+            Ok(Some(p)) => p,
             _ => return false,
         };
-
-        info!("Attempting session restore for: {username}");
-
-        let url = format!("{}/authentication/refresh", self.config.server_url);
-        let resp = match self.client
-            .post(&url)
-            .header("Cookie", format!("refresh_token={refresh_token}"))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("Session restore failed: {e}");
-                return false;
-            }
+        info!("Attempting auto-login with stored credentials for: {username}");
+        let credentials = crate::models::LoginCredentials {
+            username: username.to_string(),
+            password,
+            verification_code: None,
         };
-
-        let status = resp.status();
-        let (jwt, new_refresh) = Self::extract_cookies(&resp);
-
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            warn!("Session restore failed: HTTP {status} — {body}");
-            return false;
-        }
-
-        if let Some(token) = jwt {
-            let mut inner = self.inner.write().await;
-            inner.access_token = Some(token.clone());
-            inner.is_authenticated = true;
-            let _ = CredentialStore::store_token(&username, &token);
-            if let Some(rt) = new_refresh {
-                let _ = CredentialStore::store_refresh_token(&username, &rt);
+        match self.login(credentials).await {
+            Ok(()) => {
+                info!("Auto-login successful for: {username}");
+                true
             }
-            true
-        } else {
-            warn!("Session restore failed: no JWT in response cookies");
-            false
+            Err(e) => {
+                warn!("Auto-login failed for {username}: {e}");
+                false
+            }
         }
+    }
+
+    /// Store auth state + persist credentials to keychain after a successful login.
+    /// Centralises the duplicate logic shared by the direct-login and verify paths.
+    async fn persist_session(
+        &self,
+        username: &str,
+        token: &str,
+        refresh: Option<String>,
+        user: Option<crate::models::User>,
+    ) -> Result<()> {
+        {
+            let mut inner = self.inner.write().await;
+            inner.access_token = Some(token.to_string());
+            inner.user = user;
+            inner.is_authenticated = true;
+        }
+        CredentialStore::store_token(username, token)?;
+        CredentialStore::store_username(username)?;
+        if let Some(rt) = refresh {
+            CredentialStore::store_refresh_token(username, &rt)?;
+        }
+        Ok(())
     }
 
     /// Login with credentials (handles 2FA flow).
@@ -135,25 +218,16 @@ impl AuthState {
                 .map_err(|e| anyhow::anyhow!("Invalid verify response: {e}\n{text}"))?;
 
             if let Some(token) = jwt {
-                let mut inner = self.inner.write().await;
-                inner.access_token = Some(token.clone());
-                inner.user = response.user;
-                inner.is_authenticated = true;
-
-                // Store credentials using username from response if available,
-                // or from credentials if provided
+                // Determine the canonical username: prefer the one the user typed;
+                // fall back to the username returned in the response body.
                 let store_username = if !credentials.username.is_empty() {
                     credentials.username.clone()
-                } else if let Some(ref user) = inner.user {
-                    user.username.clone()
                 } else {
-                    "device".to_string()
+                    response.user.as_ref()
+                        .map(|u| u.username.clone())
+                        .unwrap_or_else(|| "device".to_string())
                 };
-                CredentialStore::store_token(&store_username, &token)?;
-                CredentialStore::store_username(&store_username)?;
-                if let Some(rt) = refresh {
-                    CredentialStore::store_refresh_token(&store_username, &rt)?;
-                }
+                self.persist_session(&store_username, &token, refresh, response.user).await?;
                 return Ok(());
             }
 
@@ -178,16 +252,7 @@ impl AuthState {
 
         // Direct login — server returned JWT cookie (e.g. Dart-like clients)
         if let Some(token) = jwt {
-            let mut inner = self.inner.write().await;
-            inner.access_token = Some(token.clone());
-            inner.user = response.user;
-            inner.is_authenticated = true;
-
-            CredentialStore::store_token(&credentials.username, &token)?;
-            CredentialStore::store_username(&credentials.username)?;
-            if let Some(rt) = refresh {
-                CredentialStore::store_refresh_token(&credentials.username, &rt)?;
-            }
+            self.persist_session(&credentials.username, &token, refresh, response.user).await?;
             return Ok(());
         }
 
@@ -249,7 +314,9 @@ impl AuthState {
         None
     }
 
-    /// Refresh the access token (tokens come as cookies)
+    /// Refresh the access token (tokens come as cookies).
+    /// Reserved for explicit token-refresh calls (Phase 4).
+    #[allow(dead_code)]
     pub async fn refresh_token(&self) -> Result<()> {
         let username = CredentialStore::get_last_username()?
             .ok_or_else(|| anyhow::anyhow!("No stored username"))?;
@@ -306,7 +373,8 @@ impl AuthState {
         self.inner.read().await.access_token.clone()
     }
 
-    /// Get current user
+    /// Get current user (reserved for Settings / profile display in Phase 4).
+    #[allow(dead_code)]
     pub async fn get_user(&self) -> Option<User> {
         self.inner.read().await.user.clone()
     }

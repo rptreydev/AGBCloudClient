@@ -63,11 +63,40 @@ impl CredentialStore {
         }
     }
 
+    /// Store the user's password for auto-login.
+    /// Secured by Windows Credential Manager (DPAPI-encrypted, never stored in plaintext).
+    pub fn store_password(username: &str, password: &str) -> Result<()> {
+        let key = format!("{username}_password");
+        let entry = Entry::new(SERVICE, &key)?;
+        entry.set_password(password)?;
+        debug!("Password stored securely for auto-login: {username}");
+        Ok(())
+    }
+
+    /// Get the stored password for auto-login.
+    pub fn get_password(username: &str) -> Result<Option<String>> {
+        let key = format!("{username}_password");
+        let entry = Entry::new(SERVICE, &key)?;
+        match entry.get_password() {
+            Ok(p) => Ok(Some(p)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Keyring error: {e}")),
+        }
+    }
+
+    /// Remove stored password (called on logout).
+    pub fn clear_password(username: &str) {
+        let key = format!("{username}_password");
+        let _ = Entry::new(SERVICE, &key).and_then(|e| e.delete_credential());
+        debug!("Auto-login password cleared for: {username}");
+    }
+
     /// Clear credentials for a specific user
     pub fn clear_user(username: &str) -> Result<()> {
         let _ = Entry::new(SERVICE, username).and_then(|e| e.delete_credential());
         let key = format!("{username}_refresh");
         let _ = Entry::new(SERVICE, &key).and_then(|e| e.delete_credential());
+        Self::clear_password(username);
         warn!("Credentials cleared for user: {username}");
         Ok(())
     }

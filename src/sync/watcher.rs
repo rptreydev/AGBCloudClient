@@ -1,3 +1,6 @@
+// Phase 4: local filesystem watcher for upload sync (not yet wired up).
+#![allow(dead_code)]
+
 use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;

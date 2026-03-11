@@ -19,6 +19,8 @@ pub struct User {
     pub active: Option<bool>,
 }
 
+/// Variants match the API's SCREAMING_SNAKE_CASE role strings exactly.
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum UserRole {
     SADMIN,
@@ -41,7 +43,9 @@ pub struct LoginCredentials {
     pub verification_code: Option<String>,
 }
 
-/// Auth tokens (stored as HTTP-only cookies by the API)
+/// Auth tokens (stored as HTTP-only cookies by the API).
+/// Kept for potential future use if the API switches to JSON-body token delivery.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthTokens {
     pub access_token: String,

@@ -19,6 +19,14 @@ pub struct SyncProgress {
     pub files_total: usize,
     /// Files actually downloaded this cycle (not skipped)
     pub files_downloaded: usize,
+    /// Files downloaded under a Copy policy this cycle
+    pub files_copied: usize,
+    /// Files downloaded under a KeepSynced policy this cycle
+    pub files_synced: usize,
+    /// Number of download failures this cycle
+    pub files_failed: usize,
+    /// Last download error message (for display)
+    pub last_error: Option<String>,
     /// When true, the sync engine skips its cycle (toggled from settings UI)
     pub paused: bool,
 }

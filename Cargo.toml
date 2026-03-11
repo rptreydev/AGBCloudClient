@@ -35,6 +35,9 @@ rfd = "0.15"
 winapi = { version = "0.3", features = ["winuser", "shellapi", "fileapi", "minwindef"] }
 notify-rust = "4"
 
+[build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = "s"
 lto = true

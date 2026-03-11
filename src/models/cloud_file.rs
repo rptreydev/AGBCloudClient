@@ -1,3 +1,7 @@
+// Phase 5 WebSocket models (SyncStatus, SyncedFile, CloudFileEvent*) are not
+// yet wired up but kept ready for the real-time sync implementation.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

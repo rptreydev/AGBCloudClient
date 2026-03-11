@@ -8,6 +8,7 @@ use crate::config::AppConfig;
 use crate::models::{CloudFile, FolderSelection, SyncPolicy};
 use crate::sync::progress::{SharedProgress, SyncPhase};
 use crate::sync::remote::RemoteClient;
+use crate::ui::common::NOTIFICATION_APP_ID;
 
 /// Orchestrates sync between local filesystem and remote API.
 pub struct SyncEngine {
@@ -42,18 +43,26 @@ impl SyncEngine {
                 continue;
             }
 
-            // Reset download counter for this cycle
-            self.update_progress(|p| p.files_downloaded = 0);
+            // Reset download counters for this cycle
+            self.update_progress(|p| {
+                p.files_downloaded = 0;
+                p.files_copied = 0;
+                p.files_synced = 0;
+                p.files_failed = 0;
+                p.last_error = None;
+            });
 
             if let Err(e) = self.sync_all(&config).await {
                 error!("Sync cycle error: {e}");
                 self.set_phase(SyncPhase::Error(e.to_string()));
             }
 
-            // Show notification if new files were downloaded
-            let downloaded = self.progress.lock().map(|p| p.files_downloaded).unwrap_or(0);
-            if downloaded > 0 && config.notifications_enabled {
-                Self::show_sync_notification(downloaded);
+            // Show notification with breakdown if any files were downloaded
+            let (copied, synced) = self.progress.lock()
+                .map(|p| (p.files_copied, p.files_synced))
+                .unwrap_or((0, 0));
+            if (copied > 0 || synced > 0) && config.notifications_enabled {
+                Self::show_sync_notification(copied, synced);
             }
 
             self.set_phase(SyncPhase::Idle);
@@ -61,17 +70,28 @@ impl SyncEngine {
         }
     }
 
-    fn show_sync_notification(count: usize) {
-        let body = if count == 1 {
-            "1 new file synced".to_string()
-        } else {
-            format!("{count} new files synced")
-        };
+    fn show_sync_notification(copied: usize, synced: usize) {
+        let mut lines = Vec::new();
+        if copied > 0 {
+            lines.push(format!(
+                "{} file{} copied to your device",
+                copied,
+                if copied == 1 { "" } else { "s" }
+            ));
+        }
+        if synced > 0 {
+            lines.push(format!(
+                "{} file{} kept up to date",
+                synced,
+                if synced == 1 { "" } else { "s" }
+            ));
+        }
+        let body = lines.join("\n");
         if let Err(e) = notify_rust::Notification::new()
-            .appname("AGB Cloud Client")
-            .summary("Sync Complete")
+            .app_id(NOTIFICATION_APP_ID)
+            .summary("Cloud Files — Sync Complete")
             .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .timeout(notify_rust::Timeout::Milliseconds(6000))
             .show()
         {
             debug!("Notification failed: {e}");
@@ -112,18 +132,37 @@ impl SyncEngine {
 
             let base_path = Path::new(&config.sync_folder);
 
-            // Use recursive get_children approach (more reliable than get_tree
-            // because the /folders/:uuid endpoint has depth limiting)
-            let folder_path = base_path.join(&sel.name);
+            // Build the full local path preserving the remote tree structure.
+            // sel.path is "ParentName / ChildName / ..." (built by build_path),
+            // so split by " / " and join to get e.g. sync_folder/Photos/2024/.
+            let folder_path = if !sel.path.is_empty() {
+                sel.path.split(" / ").fold(base_path.to_path_buf(), |p, c| p.join(c.trim()))
+            } else {
+                base_path.join(sel.name.trim())
+            };
             if let Err(e) = tokio::fs::create_dir_all(&folder_path).await {
                 error!("Failed to create dir {}: {e}", folder_path.display());
                 continue;
             }
 
+            let before = self.progress.lock().map(|p| p.files_downloaded).unwrap_or(0);
             match self.sync_folder_recursive(&sel.uuid, &sel.name, &folder_path).await {
                 Ok(()) => {
-                    if sel.policy == SyncPolicy::Copy {
-                        completed_uuids.push(sel.uuid.clone());
+                    let delta = self.progress.lock()
+                        .map(|p| p.files_downloaded.saturating_sub(before))
+                        .unwrap_or(0);
+                    match sel.policy {
+                        SyncPolicy::Copy => {
+                            self.update_progress(|p| p.files_copied += delta);
+                            // Only mark as completed if files were actually downloaded.
+                            // If delta == 0 (e.g. download failed or timed out), retry next cycle.
+                            if delta > 0 {
+                                completed_uuids.push(sel.uuid.clone());
+                            }
+                        }
+                        SyncPolicy::KeepSynced { .. } => {
+                            self.update_progress(|p| p.files_synced += delta);
+                        }
                     }
                 }
                 Err(e) => {
@@ -154,6 +193,10 @@ impl SyncEngine {
     /// Recursively sync a folder by fetching its children via API.
     /// Uses get_children (depth:1) at each level instead of get_tree,
     /// which avoids the backend's depth limiting.
+    ///
+    /// If `folder_uuid` turns out to belong to a file (not a folder), the file
+    /// is downloaded directly to `local_path` (after removing any empty directory
+    /// placeholder that was created by `selective_sync`).
     async fn sync_folder_recursive(
         &self,
         folder_uuid: &str,
@@ -168,21 +211,34 @@ impl SyncEngine {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to fetch children of {folder_name}: {e}");
+                self.update_progress(|p| {
+                    p.files_failed += 1;
+                    p.last_error = Some(format!("Listing '{folder_name}' failed: {e}"));
+                });
                 return Err(e);
             }
         };
 
         for child in &children {
             if child.folder {
-                let child_path = local_path.join(&child.name);
+                let child_path = local_path.join(child.name.trim());
                 if let Err(e) = tokio::fs::create_dir_all(&child_path).await {
                     error!("Failed to create dir {}: {e}", child_path.display());
                     continue;
                 }
-                Box::pin(self.sync_folder_recursive(&child.uuid, &child.name, &child_path)).await?;
+                if let Err(e) = Box::pin(self.sync_folder_recursive(&child.uuid, &child.name, &child_path)).await {
+                    error!("Failed to sync subfolder {}: {e}", child.name);
+                    // Note: files_failed already incremented inside the recursive call
+                }
             } else {
-                let file_path = local_path.join(&child.name);
-                self.download_file_if_needed(child, &file_path).await?;
+                let file_path = local_path.join(child.name.trim());
+                if let Err(e) = self.download_file_if_needed(child, &file_path).await {
+                    error!("Failed to download {}: {e}", child.name);
+                    self.update_progress(|p| {
+                        p.files_failed += 1;
+                        p.last_error = Some(format!("{}: {e}", child.name));
+                    });
+                }
             }
         }
 
@@ -191,15 +247,35 @@ impl SyncEngine {
 
     /// Download a remote file if it doesn't exist locally yet.
     async fn download_file_if_needed(&self, file: &CloudFile, dest: &Path) -> Result<()> {
+        // Skip virtual entries that have no actual file stored on the server.
+        if file.no_file == Some(true) {
+            debug!("Skipping no_file entry: {}", file.name);
+            return Ok(());
+        }
+
         self.update_progress(|p| {
             p.files_total += 1;
         });
 
         if dest.exists() {
-            // TODO: compare hashes for change detection
-            debug!("File exists, skipping: {}", dest.display());
-            self.update_progress(|p| p.files_done += 1);
-            return Ok(());
+            if dest.is_dir() {
+                // A directory exists where a file should be — this happens when a file UUID
+                // was accidentally saved as a sync target in a previous run, causing
+                // `selective_sync` to call `create_dir_all` with the file's name.
+                // Remove the empty directory so we can download the actual file.
+                warn!("Directory found at file path — removing: {}", dest.display());
+                if let Err(e) = tokio::fs::remove_dir(dest).await {
+                    error!("Could not remove directory at {}: {e}", dest.display());
+                    self.update_progress(|p| p.files_done += 1);
+                    return Ok(()); // Can't overwrite a non-empty dir — skip for now
+                }
+                // Directory removed — fall through to download below
+            } else {
+                // Regular file already exists — skip (already synced)
+                debug!("File exists, skipping: {}", dest.display());
+                self.update_progress(|p| p.files_done += 1);
+                return Ok(());
+            }
         }
 
         self.update_progress(|p| {
@@ -213,6 +289,7 @@ impl SyncEngine {
         self.update_progress(|p| {
             p.files_done += 1;
             p.files_downloaded += 1;
+            p.current_file.clear(); // clear so bar doesn't stay at half-credit after download
         });
         Ok(())
     }

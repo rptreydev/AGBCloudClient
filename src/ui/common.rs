@@ -33,7 +33,6 @@ pub const BTN_BORDER: egui::Color32 = egui::Color32::from_rgb(55, 70, 100);
 pub const BTN_HOVER: egui::Color32 = egui::Color32::from_rgb(44, 58, 85);
 pub const INPUT_BG: egui::Color32 = egui::Color32::from_rgb(18, 24, 40);
 pub const INPUT_BORDER: egui::Color32 = egui::Color32::from_rgb(50, 65, 90);
-pub const CHIP_BG: egui::Color32 = egui::Color32::from_rgb(0, 50, 70);
 pub const DIVIDER: egui::Color32 = egui::Color32::from_rgb(40, 52, 72);
 pub const TITLE_BAR_BG: egui::Color32 = egui::Color32::from_rgb(12, 16, 24);
 
@@ -176,8 +175,11 @@ pub fn tree_expand_button(ui: &mut egui::Ui, expanded: bool) -> egui::Response {
 
 // ── Custom checkbox ──
 
-/// Large, high-visibility checkbox with ACCENT fill when checked.
-pub fn custom_checkbox(ui: &mut egui::Ui, checked: &mut bool) -> egui::Response {
+/// Large, high-visibility checkbox with three visual states:
+/// - `checked=true, intermediate=false` → ACCENT fill + checkmark (explicitly selected)
+/// - `checked=true, intermediate=true`  → ACCENT_DIM fill + dash   (ancestor marker)
+/// - `checked=false`                    → INPUT_BG (not selected)
+pub fn custom_checkbox(ui: &mut egui::Ui, checked: &mut bool, intermediate: bool) -> egui::Response {
     let size = egui::vec2(20.0, 20.0);
     let (rect, mut response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.clicked() {
@@ -188,21 +190,39 @@ pub fn custom_checkbox(ui: &mut egui::Ui, checked: &mut bool) -> egui::Response 
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let painter = ui.painter();
-    let bg = if *checked { ACCENT } else { INPUT_BG };
-    let border_color = if response.hovered() { ACCENT } else if *checked { ACCENT } else { TEXT_SECONDARY };
+    let bg = if *checked {
+        if intermediate { ACCENT_DIM } else { ACCENT }
+    } else {
+        INPUT_BG
+    };
+    let border_color = if response.hovered() {
+        ACCENT
+    } else if *checked {
+        if intermediate { ACCENT_DIM } else { ACCENT }
+    } else {
+        TEXT_SECONDARY
+    };
     painter.rect(rect, 3.0, bg, egui::Stroke::new(1.5, border_color));
     if *checked {
-        // Checkmark
         let c = rect.center();
         let stroke = egui::Stroke::new(2.5, TEXT_PRIMARY);
-        painter.line_segment(
-            [egui::pos2(c.x - 5.0, c.y - 0.5), egui::pos2(c.x - 1.5, c.y + 3.5)],
-            stroke,
-        );
-        painter.line_segment(
-            [egui::pos2(c.x - 1.5, c.y + 3.5), egui::pos2(c.x + 5.0, c.y - 4.0)],
-            stroke,
-        );
+        if intermediate {
+            // Dash — indicates "contains selected children, not directly selected"
+            painter.line_segment(
+                [egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)],
+                stroke,
+            );
+        } else {
+            // Full checkmark
+            painter.line_segment(
+                [egui::pos2(c.x - 5.0, c.y - 0.5), egui::pos2(c.x - 1.5, c.y + 3.5)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(c.x - 1.5, c.y + 3.5), egui::pos2(c.x + 5.0, c.y - 4.0)],
+                stroke,
+            );
+        }
     }
     response
 }
@@ -216,6 +236,7 @@ pub fn render_tree(
     depth: usize,
     actions: &mut Vec<TreeAction>,
     search: &str,
+    preview: &mut Option<CloudFile>,
 ) {
     for node in nodes.iter_mut() {
         if !search.is_empty() {
@@ -228,21 +249,32 @@ pub fn render_tree(
 
         let indent = depth as f32 * 22.0;
         let uuid = node.file.uuid.clone();
+        // contains_key is true for both explicit selections AND ancestor markers (None),
+        // so the parent appears checked when any child is selected.
         let is_selected = selected.contains_key(&uuid);
+        // flatten() is None for ancestor markers — policy buttons are hidden for them,
+        // preventing accidental promotion of a marker to an explicit selection.
         let policy = selected.get(&uuid).cloned().flatten();
+        // Ancestor marker: checked but no direct policy → show dash (not full checkmark)
+        let is_ancestor_marker = is_selected && policy.is_none();
 
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.add_space(indent);
 
-            // Checkbox (custom high-visibility)
-            let mut cb_val = is_selected;
-            if custom_checkbox(ui, &mut cb_val).changed() {
-                if cb_val {
-                    actions.push(TreeAction::Select(uuid.clone()));
-                } else {
-                    actions.push(TreeAction::Deselect(uuid.clone()));
+            // Checkbox only for folder nodes — files are informational, not sync targets.
+            if node.file.folder {
+                let mut cb_val = is_selected;
+                if custom_checkbox(ui, &mut cb_val, is_ancestor_marker).changed() {
+                    if cb_val {
+                        actions.push(TreeAction::Select(uuid.clone()));
+                    } else {
+                        actions.push(TreeAction::Deselect(uuid.clone()));
+                    }
                 }
+            } else {
+                // Reserve the same horizontal space so file rows stay aligned with folder rows.
+                ui.add_space(22.0);
             }
             ui.add_space(4.0);
 
@@ -262,11 +294,24 @@ pub fn render_tree(
             }
             ui.add_space(8.0);
 
-            // Name
-            ui.label(egui::RichText::new(&node.file.name).size(13.0).color(TEXT_PRIMARY));
+            // Name — clicking a file row sets it as the preview target
+            let name_resp = ui.add(
+                egui::Label::new(egui::RichText::new(&node.file.name).size(13.0).color(TEXT_PRIMARY))
+                    .sense(egui::Sense::click()),
+            );
+            if name_resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                *preview = Some(node.file.clone());
+                // Clicking the name on a folder also toggles expand
+                if node.file.folder {
+                    node.expanded = !node.expanded;
+                    if node.expanded && !node.children_loaded {
+                        actions.push(TreeAction::FetchChildren(uuid.clone()));
+                    }
+                }
+            }
 
-            // Policy buttons (only for selected items)
-            if is_selected {
+            // Policy buttons only for explicit selections (policy.is_some()).
+            if policy.is_some() {
                 ui.add_space(8.0);
                 let is_copy = matches!(&policy, Some(SyncPolicy::Copy));
                 let is_sync = matches!(&policy, Some(SyncPolicy::KeepSynced { .. }));
@@ -287,12 +332,14 @@ pub fn render_tree(
 
             // Size
             if let Some(size) = node.file.size {
-                ui.label(egui::RichText::new(format_size(size)).size(11.0).color(TEXT_SECONDARY));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new(format_size(size)).size(11.0).color(TEXT_SECONDARY));
+                });
             }
         });
 
         if node.expanded && node.file.folder {
-            render_tree(ui, &mut node.children, selected, depth + 1, actions, search);
+            render_tree(ui, &mut node.children, selected, depth + 1, actions, search, preview);
         }
     }
 }
@@ -402,7 +449,7 @@ pub fn has_selected_descendant(
 pub fn calc_selected_size(nodes: &[TreeNode], selected: &HashMap<String, Option<SyncPolicy>>) -> u64 {
     let mut total = 0u64;
     for node in nodes {
-        if selected.contains_key(&node.file.uuid) {
+        if matches!(selected.get(&node.file.uuid), Some(Some(_))) {
             total += node_total_size(node);
         } else {
             total += calc_selected_size(&node.children, selected);
@@ -440,6 +487,10 @@ pub fn collect_selections(
     out: &mut Vec<FolderSelection>,
 ) {
     for node in nodes {
+        // Only folders can be sync targets — skip file nodes entirely.
+        if !node.file.folder {
+            continue;
+        }
         if let Some(Some(policy)) = selected.get(&node.file.uuid) {
             out.push(FolderSelection {
                 uuid: node.file.uuid.clone(),
@@ -496,26 +547,12 @@ pub fn tonal_button(label: &str) -> egui::Button<'_> {
         .fill(SURFACE_VARIANT)
 }
 
-/// Material outlined button (tertiary action).
-pub fn outlined_button(label: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(label).size(13.0).color(TEXT_SECONDARY))
-        .min_size(egui::vec2(85.0, 36.0))
-        .rounding(18.0)
-        .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0, DIVIDER))
-}
-
 /// Material text button (minimal emphasis).
 pub fn text_button(label: &str) -> egui::Button<'_> {
     egui::Button::new(egui::RichText::new(label).size(13.0).color(TEXT_SECONDARY))
         .min_size(egui::vec2(70.0, 36.0))
         .rounding(18.0)
         .fill(egui::Color32::TRANSPARENT)
-}
-
-pub fn styled_button(label: &str) -> egui::Button<'_> {
-    filled_button(label, true)
-        .min_size(egui::vec2(280.0, 36.0))
 }
 
 /// Material divider line.
@@ -576,12 +613,13 @@ pub fn create_explorer_sidebar(sync_folder: &str) -> anyhow::Result<()> {
     let guid = "{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}";
     let clsid = format!(r"HKCU\Software\Classes\CLSID\{guid}");
 
-    reg_set(&clsid, None, "CloudFiles", "REG_SZ")?;
+    reg_set(&clsid, None, "AGB CloudFiles", "REG_SZ")?;
     reg_set_dword(&clsid, "SortOrderIndex", 0x42)?;
     reg_set_dword(&clsid, "System.IsPinnedToNameSpaceTree", 1)?;
-    let icon_value = exe_icon_path().unwrap_or_else(|| "shell32.dll,3".to_string());
+    let icon_value = exe_icon_path().unwrap_or_else(|| "%SystemRoot%\\system32\\imageres.dll,-1040".to_string());
     reg_set(&format!(r"{clsid}\DefaultIcon"), None, &icon_value, "REG_SZ")?;
-    reg_set(&format!(r"{clsid}\InProcServer32"), None, "", "REG_SZ")?;
+    reg_set(&format!(r"{clsid}\InProcServer32"), None, "%SystemRoot%\\system32\\shell32.dll", "REG_EXPAND_SZ")?;
+    reg_set(&format!(r"{clsid}\InProcServer32"), Some("ThreadingModel"), "Apartment", "REG_SZ")?;
     reg_set(
         &format!(r"{clsid}\Instance"),
         Some("CLSID"),
@@ -595,12 +633,185 @@ pub fn create_explorer_sidebar(sync_folder: &str) -> anyhow::Result<()> {
     reg_set_dword(&sf, "FolderValueFlags", 0x28)?;
     reg_set_dword(&sf, "Attributes", 0xf080004d)?;
     let ns = format!(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{guid}");
-    reg_set(&ns, None, "CloudFiles", "REG_SZ")?;
+    reg_set(&ns, None, "AGB CloudFiles", "REG_SZ")?;
     let hide = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
     reg_set_dword(hide, guid, 1)?;
+    // Apply custom icon to the sync folder itself (visible in File Explorer).
+    let _ = create_folder_icon(sync_folder);
+    // Notify shell to refresh navigation pane without restarting Explorer.
+    notify_shell_namespace_change();
     info!("Explorer sidebar registered for: {sync_folder}");
     Ok(())
 }
+
+/// Remove the Explorer navigation pane entry and the folder icon for `sync_folder`.
+/// Safe to call even if the entry was never created (registry deletes are idempotent).
+pub fn remove_explorer_sidebar(sync_folder: &str) -> anyhow::Result<()> {
+    let guid = "{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}";
+
+    // Delete the entire CLSID subtree (all keys and values under it).
+    let clsid = format!(r"HKCU\Software\Classes\CLSID\{guid}");
+    let _ = no_window_cmd("reg").args(["delete", &clsid, "/f"]).output();
+
+    // Delete the NameSpace registration.
+    let ns = format!(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{guid}",
+    );
+    let _ = no_window_cmd("reg").args(["delete", &ns, "/f"]).output();
+
+    // Delete the HideDesktopIcons value.
+    let hide = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel";
+    let _ = no_window_cmd("reg").args(["delete", hide, "/v", guid, "/f"]).output();
+
+    // Also clean up the folder icon (desktop.ini + ReadOnly attribute).
+    let _ = remove_folder_icon(sync_folder);
+
+    info!("Explorer sidebar entry removed for: {sync_folder}");
+    Ok(())
+}
+
+/// Give the sync folder a custom AGB icon visible in File Explorer.
+///
+/// Creates a `desktop.ini` file inside the folder with `[.ShellClassInfo]` →
+/// `IconResource` pointing to the app's embedded icon, then marks:
+/// - The folder as **ReadOnly** (`+r`) — tells Explorer to honour `desktop.ini`.
+/// - `desktop.ini` as **System + Hidden** (`+s +h`) — read by Explorer, hidden from users.
+pub fn create_folder_icon(sync_folder: &str) -> anyhow::Result<()> {
+    std::fs::create_dir_all(sync_folder)?;
+
+    // `IconResource` must be "path,index".  `exe_icon_path()` already returns
+    // "path,0" for .exe files; append ",0" only when the path has no index yet.
+    let raw = exe_icon_path().unwrap_or_else(|| {
+        std::env::current_exe()
+            .map(|p| format!("{},0", p.to_string_lossy()))
+            .unwrap_or_else(|_| "%SystemRoot%\\system32\\imageres.dll,-1040".to_string())
+    });
+    let icon_resource = if raw.contains(',') { raw } else { format!("{raw},0") };
+
+    // Write desktop.ini with CRLF line endings (required on Windows).
+    let content = format!(
+        "[.ShellClassInfo]\r\nIconResource={icon_resource}\r\nInfoTip=AGB CloudFiles Sync Folder\r\n",
+    );
+    let ini_path = std::path::Path::new(sync_folder).join("desktop.ini");
+    std::fs::write(&ini_path, content.as_bytes())?;
+
+    // Mark desktop.ini as System+Hidden so Explorer reads it and users don't see it.
+    let ini_str = ini_path.to_string_lossy().to_string();
+    let _ = no_window_cmd("attrib").args(["+s", "+h", &ini_str]).output();
+
+    // Mark the folder as ReadOnly — triggers Explorer to honour desktop.ini.
+    let _ = no_window_cmd("attrib").args(["+r", sync_folder]).output();
+
+    info!("Folder icon applied: {sync_folder}");
+    Ok(())
+}
+
+/// Reverse `create_folder_icon`: delete `desktop.ini` and clear the ReadOnly flag.
+pub fn remove_folder_icon(sync_folder: &str) -> anyhow::Result<()> {
+    let ini_path = std::path::Path::new(sync_folder).join("desktop.ini");
+    if ini_path.exists() {
+        // Clear System+Hidden so the file can be deleted.
+        let ini_str = ini_path.to_string_lossy().to_string();
+        let _ = no_window_cmd("attrib").args(["-s", "-h", &ini_str]).output();
+        let _ = std::fs::remove_file(&ini_path);
+    }
+    // Remove the ReadOnly attribute from the folder.
+    let _ = no_window_cmd("attrib").args(["-r", sync_folder]).output();
+    info!("Folder icon removed: {sync_folder}");
+    Ok(())
+}
+
+/// Delete the `AGB CloudFiles.lnk` shortcut from the user's Desktop.
+/// No-ops silently if the file does not exist.
+pub fn remove_desktop_shortcut() -> anyhow::Result<()> {
+    let user_dirs = directories::UserDirs::new()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine user directories"))?;
+    let desktop = user_dirs
+        .desktop_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not find Desktop directory"))?;
+    let path = desktop.join("AGB CloudFiles.lnk");
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        info!("Desktop shortcut removed: {}", path.display());
+    } else {
+        info!("Desktop shortcut not found — nothing to remove");
+    }
+    Ok(())
+}
+
+/// Notify the Windows shell that namespace/association changes occurred.
+/// This causes Explorer to refresh its navigation pane without restarting.
+/// Uses SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, NULL, NULL).
+pub fn notify_shell_namespace_change() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // SHChangeNotify is not in winapi crate — declare extern manually.
+        unsafe extern "system" {
+            fn SHChangeNotify(
+                wEventId: i32,
+                uFlags: u32,
+                dwItem1: *mut std::ffi::c_void,
+                dwItem2: *mut std::ffi::c_void,
+            );
+        }
+        const SHCNE_ASSOCCHANGED: i32 = 0x08000000;
+        const SHCNF_IDLIST: u32 = 0x0000;
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, std::ptr::null_mut(), std::ptr::null_mut());
+    }
+    info!("Shell namespace change notification sent");
+}
+
+/// Kill Explorer.exe and restart it so registry changes (e.g. namespace) take effect.
+///
+/// Blocks until `Shell_TrayWnd` is visible (Explorer's taskbar fully loaded) or
+/// the 10-second timeout expires.  This prevents race conditions where the
+/// caller spawns a tray-icon process before the notification area exists —
+/// `Shell_NotifyIcon(NIM_ADD)` silently fails if Shell_TrayWnd is not yet running.
+pub fn restart_explorer() -> anyhow::Result<()> {
+    no_window_cmd("taskkill")
+        .args(["/f", "/im", "explorer.exe"])
+        .output()?;
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    no_window_cmd("explorer.exe").spawn()?;
+    // Wait for Explorer's notification area to be ready before returning.
+    wait_for_shell_tray_wnd(10_000);
+    Ok(())
+}
+
+/// Poll for `Shell_TrayWnd` (Explorer's system tray host window) with a timeout.
+/// Returns as soon as the window is found, or after `timeout_ms` milliseconds.
+#[cfg(target_os = "windows")]
+fn wait_for_shell_tray_wnd(timeout_ms: u64) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let class_wide: Vec<u16> = OsStr::new("Shell_TrayWnd")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms);
+
+    while std::time::Instant::now() < deadline {
+        let hwnd = unsafe {
+            winapi::um::winuser::FindWindowW(class_wide.as_ptr(), std::ptr::null())
+        };
+        if !hwnd.is_null() {
+            // Shell_TrayWnd visible — give the notification area a moment to
+            // finish initialising before callers register new tray icons.
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            info!("Explorer taskbar ready (Shell_TrayWnd found)");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // Timeout reached — continue anyway; tray-icon handles WM_TASKBARCREATED.
+    info!("restart_explorer: Shell_TrayWnd timeout — continuing");
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_shell_tray_wnd(_timeout_ms: u64) {}
 
 pub fn create_desktop_shortcut(sync_folder: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(sync_folder)?;
@@ -612,7 +823,7 @@ pub fn create_desktop_shortcut(sync_folder: &str) -> anyhow::Result<()> {
     if !desktop.exists() {
         anyhow::bail!("Desktop not found at: {}", desktop.display());
     }
-    let shortcut_path = desktop.join("CloudFiles.lnk");
+    let shortcut_path = desktop.join("AGB CloudFiles.lnk");
     let icon_loc = exe_icon_path().unwrap_or_else(|| "shell32.dll,3".to_string());
     let ps = format!(
         "$ws = New-Object -ComObject WScript.Shell; \
@@ -677,15 +888,22 @@ fn reg_set_dword(key: &str, name: &str, value: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Get the path to icon.ico next to the running executable.
+/// Return the icon path used for shell registrations (Explorer sidebar, desktop shortcut).
+///
+/// Priority:
+///   1. `icon.ico` next to the exe (present during dev if the file is placed there)
+///   2. The exe itself at resource index 0 — installed builds have the AGB icon embedded
+///      via the NSIS resource compiler, so `app.exe,0` always shows the branded icon.
 fn exe_icon_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
+    // Prefer a dedicated .ico file when available (dev / portable layout)
     let icon = exe.parent()?.join("icon.ico");
     if icon.exists() {
-        Some(icon.to_string_lossy().to_string())
-    } else {
-        None
+        return Some(icon.to_string_lossy().into_owned());
     }
+    // Fallback: exe,0 — resource index 0 is the first (app) icon embedded in the binary.
+    // In a release / NSIS-installed build this is the AGB branded icon.
+    Some(format!("{},0", exe.to_string_lossy()))
 }
 
 fn powershell_path() -> String {
@@ -695,6 +913,33 @@ fn powershell_path() -> String {
     }
     "powershell.exe".to_string()
 }
+
+/// Register the app's Windows AppUserModelID (AUMID) so toast notifications
+/// show the AGB icon and "AGB Cloud Client" title instead of the PowerShell icon.
+///
+/// Writes to `HKCU\Software\Classes\AppUserModelId\AGBroadband.CloudClient`.
+/// Safe to call on every startup — registry writes are idempotent.
+pub fn register_notification_app_id() {
+    #[cfg(target_os = "windows")]
+    {
+        const AUMID: &str = "AGBroadband.CloudClient";
+        let key = format!(r"HKCU\Software\Classes\AppUserModelId\{AUMID}");
+        let _ = reg_set(&key, Some("DisplayName"), "AGB Cloud Client", "REG_SZ");
+        let icon = exe_icon_path().unwrap_or_else(|| {
+            std::env::current_exe()
+                .map(|p| format!("{},0", p.to_string_lossy()))
+                .unwrap_or_default()
+        });
+        if !icon.is_empty() {
+            let _ = reg_set(&key, Some("DisplayIcon"), &icon, "REG_SZ");
+        }
+        info!("Notification AUMID registered: {AUMID}");
+    }
+}
+
+/// The AppUserModelID used for Windows toast notifications.
+/// Must match the AUMID registered by [`register_notification_app_id`].
+pub const NOTIFICATION_APP_ID: &str = "AGBroadband.CloudClient";
 
 /// Enable or disable auto-start with Windows via the Run registry key.
 pub fn set_auto_start(enable: bool) -> anyhow::Result<()> {

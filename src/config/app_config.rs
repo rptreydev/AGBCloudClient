@@ -98,7 +98,8 @@ impl AppConfig {
         Ok(dirs.config_dir().join("config.json"))
     }
 
-    /// Get the data directory for sync state database
+    /// Get the data directory for sync state database (used by Phase 4 SyncState).
+    #[allow(dead_code)]
     pub fn data_dir() -> Result<PathBuf> {
         let dirs = ProjectDirs::from("com", "AGBroadband", "AGBCloudClient")
             .ok_or_else(|| anyhow::anyhow!("Could not determine data directory"))?;

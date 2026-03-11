@@ -1,3 +1,6 @@
+// Phase 4: persistent sync-state tracking (not yet wired up).
+#![allow(dead_code)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

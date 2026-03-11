@@ -1,8 +1,2 @@
-/// Menu actions for the system tray context menu
-pub enum TrayAction {
-    OpenFolder,
-    ManageFolders,
-    Settings,
-    Logout,
-    Quit,
-}
+// Tray menu types are defined in tray/mod.rs (MenuAction enum + MenuIds struct).
+// This module is reserved for future menu extensions.

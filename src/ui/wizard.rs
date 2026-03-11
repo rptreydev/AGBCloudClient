@@ -3,7 +3,6 @@
 //! Steps: Welcome → SyncFolder → Login → SelectFolders → Finish
 //! After finishing, stays open showing sync progress until the user clicks "Close".
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use eframe::egui;
 use tokio::runtime::Runtime;
@@ -11,11 +10,12 @@ use tracing::{error, info};
 
 use crate::auth::AuthState;
 use crate::config::AppConfig;
-use crate::models::{FolderSelection, LoginCredentials, SyncPolicy};
+use crate::models::FolderSelection;
 use crate::sync::progress::{SharedProgress, SyncPhase};
-use crate::sync::remote::RemoteClient;
 use crate::sync::SyncEngine;
 use crate::ui::common::*;
+use crate::ui::folder_tree::FolderTreeWidget;
+use crate::ui::login_widget::{LoginOutcome, LoginWidget};
 
 #[derive(PartialEq, Clone, Copy)]
 enum WizardStep {
@@ -53,13 +53,6 @@ impl WizardStep {
     }
 }
 
-/// Result from async login attempt
-enum LoginResult {
-    Success,
-    Needs2FA(String),
-    Error(String),
-}
-
 struct WizardApp {
     step: WizardStep,
 
@@ -70,25 +63,11 @@ struct WizardApp {
     last_disk_path: String,
 
     // Login step
-    username: String,
-    password: String,
-    verification_code: String,
-    login_error: String,
-    login_info: String,
-    login_loading: bool,
-    needs_2fa: bool,
+    login: LoginWidget,
     login_complete: bool,
-    login_rx: Option<std::sync::mpsc::Receiver<LoginResult>>,
 
     // SelectFolders step
-    roots: Vec<TreeNode>,
-    selected_policies: HashMap<String, Option<SyncPolicy>>,
-    /// UUIDs explicitly selected by the user (not auto-propagated to ancestors)
-    explicit_selections: std::collections::HashSet<String>,
-    tree_loading: bool,
-    tree_error: String,
-    tree_rx: Option<std::sync::mpsc::Receiver<FetchResult>>,
-    search_query: String,
+    tree: FolderTreeWidget,
 
     // Finish step
     add_explorer_sidebar: bool,
@@ -98,6 +77,9 @@ struct WizardApp {
     // Syncing step — progress from running sync engine
     progress: SharedProgress,
     sync_started: bool,
+    last_phase: SyncPhase,
+    /// Set once when sync completes: (is_success, files_done, error_msg)
+    sync_banner: Option<(bool, usize, String)>,
 
     // Shared
     auth: AuthState,
@@ -110,33 +92,23 @@ impl WizardApp {
     fn new(config: &AppConfig, auth: AuthState, handle: tokio::runtime::Handle, progress: SharedProgress) -> Self {
         let sync_folder = config.sync_folder.clone();
         let (disk_total, disk_free) = get_disk_space(&sync_folder).unwrap_or((0, 0));
+        let tree = FolderTreeWidget::new(auth.clone(), handle.clone());
         Self {
             step: WizardStep::Welcome,
             sync_folder: sync_folder.clone(),
             disk_total,
             disk_free,
             last_disk_path: sync_folder,
-            username: String::new(),
-            password: String::new(),
-            verification_code: String::new(),
-            login_error: String::new(),
-            login_info: String::new(),
-            login_loading: false,
-            needs_2fa: false,
+            login: LoginWidget::new(auth.clone(), handle.clone()),
             login_complete: false,
-            login_rx: None,
-            roots: Vec::new(),
-            selected_policies: HashMap::new(),
-            explicit_selections: std::collections::HashSet::new(),
-            tree_loading: false,
-            tree_error: String::new(),
-            tree_rx: None,
-            search_query: String::new(),
+            tree,
             add_explorer_sidebar: true,
             create_desktop_shortcut_opt: true,
-            start_with_windows: false,
+            start_with_windows: true,
             progress,
             sync_started: false,
+            last_phase: SyncPhase::Idle,
+            sync_banner: None,
             auth,
             handle,
             done: false,
@@ -159,11 +131,7 @@ impl WizardApp {
             WizardStep::Welcome => true,
             WizardStep::SyncFolder => !self.sync_folder.is_empty(),
             WizardStep::Login => self.login_complete,
-            WizardStep::SelectFolders => {
-                // At least one folder must have a real policy (Some(policy)).
-                // Ancestor markers (None) don't count — they're just UI helpers.
-                self.selected_policies.values().any(|p| p.is_some())
-            }
+            WizardStep::SelectFolders => self.tree.has_real_selection(),
             WizardStep::Finish => true,
             WizardStep::Syncing => false,
         }
@@ -199,8 +167,8 @@ impl WizardApp {
     }
 
     fn on_step_enter(&mut self) {
-        if self.step == WizardStep::SelectFolders && self.roots.is_empty() {
-            self.fetch_roots();
+        if self.step == WizardStep::SelectFolders {
+            self.tree.fetch_roots();
         }
     }
 
@@ -218,183 +186,8 @@ impl WizardApp {
         info!("Wizard: sync engine started");
     }
 
-    // ── Login logic ──
-
-    fn attempt_login(&mut self) {
-        self.login_loading = true;
-        self.login_error.clear();
-        self.login_info.clear();
-
-        let credentials = LoginCredentials {
-            username: self.username.clone(),
-            password: self.password.clone(),
-            verification_code: if self.needs_2fa {
-                Some(self.verification_code.clone())
-            } else {
-                None
-            },
-        };
-
-        let auth = self.auth.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.login_rx = Some(rx);
-
-        self.handle.spawn(async move {
-            match auth.login(credentials).await {
-                Ok(()) => { let _ = tx.send(LoginResult::Success); }
-                Err(e) => {
-                    let msg = e.to_string();
-                    if msg.contains("2FA_REQUIRED") {
-                        let _ = tx.send(LoginResult::Needs2FA(
-                            "Verification code sent to your email".to_string(),
-                        ));
-                    } else {
-                        let _ = tx.send(LoginResult::Error(msg));
-                    }
-                }
-            }
-        });
-    }
-
-    fn poll_login(&mut self) {
-        let result = self.login_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(result) = result {
-            self.login_loading = false;
-            self.login_rx = None;
-            match result {
-                LoginResult::Success => {
-                    info!("Login successful via wizard");
-                    self.login_complete = true;
-                    self.advance();
-                }
-                LoginResult::Needs2FA(msg) => {
-                    self.needs_2fa = true;
-                    self.login_info = msg;
-                }
-                LoginResult::Error(msg) => {
-                    error!("Login error: {msg}");
-                    self.login_error = msg;
-                }
-            }
-        }
-    }
-
-    // ── Tree logic ──
-
-    fn fetch_roots(&mut self) {
-        self.tree_loading = true;
-        self.tree_error.clear();
-        let auth = self.auth.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.tree_rx = Some(rx);
-        self.handle.spawn(async move {
-            let remote = RemoteClient::new(auth);
-            match remote.get_roots().await {
-                Ok(roots) => { let _ = tx.send(FetchResult::Roots(roots)); }
-                Err(e) => { let _ = tx.send(FetchResult::Error(e.to_string())); }
-            }
-        });
-    }
-
-    fn fetch_children(&mut self, folder_uuid: &str) {
-        let uuid = folder_uuid.to_string();
-        let auth = self.auth.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.tree_rx = Some(rx);
-        self.handle.spawn(async move {
-            let remote = RemoteClient::new(auth);
-            match remote.get_children(&uuid).await {
-                Ok(children) => { let _ = tx.send(FetchResult::Children(uuid, children)); }
-                Err(e) => { let _ = tx.send(FetchResult::Error(e.to_string())); }
-            }
-        });
-    }
-
-    fn poll_tree(&mut self) {
-        let result = self.tree_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(result) = result {
-            self.tree_loading = false;
-            match result {
-                FetchResult::Roots(roots) => {
-                    self.roots = roots.into_iter().map(TreeNode::from_cloud_file).collect();
-                    info!("Wizard: loaded {} root folders", self.roots.len());
-                }
-                FetchResult::Children(parent_uuid, children) => {
-                    insert_children(&mut self.roots, &parent_uuid, children);
-                    // Only propagate to children if parent has a REAL policy (not None ancestor marker)
-                    if let Some(Some(policy)) = self.selected_policies.get(&parent_uuid) {
-                        let policy = policy.clone();
-                        for uuid in collect_descendant_uuids(&self.roots, &parent_uuid) {
-                            self.selected_policies.entry(uuid).or_insert(Some(policy.clone()));
-                        }
-                    }
-                }
-                FetchResult::Error(msg) => {
-                    error!("Wizard fetch error: {msg}");
-                    self.tree_error = msg;
-                }
-            }
-        }
-    }
-
-    fn process_tree_actions(&mut self, actions: Vec<TreeAction>) {
-        for action in actions {
-            match action {
-                TreeAction::Select(uuid) => {
-                    self.explicit_selections.insert(uuid.clone());
-                    self.selected_policies.insert(uuid.clone(), Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
-                    for d in collect_descendant_uuids(&self.roots, &uuid) {
-                        self.explicit_selections.insert(d.clone());
-                        self.selected_policies.entry(d).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
-                    }
-                    // Auto-select ancestors with default Sync policy (not added to explicit_selections)
-                    for a in find_ancestor_uuids(&self.roots, &uuid) {
-                        self.selected_policies.entry(a).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
-                    }
-                }
-                TreeAction::Deselect(uuid) => {
-                    self.selected_policies.remove(&uuid);
-                    self.explicit_selections.remove(&uuid);
-                    for d in collect_descendant_uuids(&self.roots, &uuid) {
-                        self.selected_policies.remove(&d);
-                        self.explicit_selections.remove(&d);
-                    }
-                    // Clean up auto-selected ancestors (bottom-up) when no more selected descendants
-                    let mut ancestors = find_ancestor_uuids(&self.roots, &uuid);
-                    ancestors.reverse();
-                    for a in ancestors {
-                        if !self.explicit_selections.contains(&a)
-                            && !has_selected_descendant(&self.roots, &a, &self.selected_policies)
-                        {
-                            self.selected_policies.remove(&a);
-                        }
-                    }
-                }
-                TreeAction::SetPolicy(uuid, policy) => {
-                    // Explicitly setting a policy promotes the node to explicit
-                    self.explicit_selections.insert(uuid.clone());
-                    self.selected_policies.insert(uuid.clone(), Some(policy.clone()));
-                    for d in collect_descendant_uuids(&self.roots, &uuid) {
-                        if self.selected_policies.contains_key(&d) {
-                            self.selected_policies.insert(d, Some(policy.clone()));
-                        }
-                    }
-                }
-                TreeAction::FetchChildren(uuid) => {
-                    self.fetch_children(&uuid);
-                }
-            }
-        }
-    }
-
-    fn selected_size(&self) -> u64 {
-        calc_selected_size(&self.roots, &self.selected_policies)
-    }
-
     fn build_selections(&self) -> Vec<FolderSelection> {
-        let mut out = Vec::new();
-        collect_selections(&self.roots, &self.selected_policies, &self.roots, &mut out);
-        out
+        self.tree.build_selections()
     }
 
     // ── Step renderers ──
@@ -529,142 +322,15 @@ impl WizardApp {
     }
 
     fn render_login(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(16.0);
-
-            egui::Frame::default()
-                .fill(CARD_BG)
-                .rounding(16.0)
-                .inner_margin(egui::Margin::same(32.0))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 50, 72)))
-                .show(ui, |ui| {
-                    ui.set_width(340.0);
-
-                    if !self.needs_2fa {
-                        // ── Step 1: Username + Password ──
-                        ui.label(
-                            egui::RichText::new("Sign In")
-                                .size(24.0)
-                                .color(TEXT_PRIMARY)
-                                .strong(),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Enter your AGBroadband credentials")
-                                .size(13.0)
-                                .color(TEXT_SECONDARY),
-                        );
-                        ui.add_space(24.0);
-
-                        ui.label(egui::RichText::new("Username").size(12.0).color(TEXT_SECONDARY));
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.username)
-                                .desired_width(320.0)
-                                .hint_text("Enter your username")
-                                .margin(egui::Margin::symmetric(12.0, 10.0)),
-                        );
-                        ui.add_space(16.0);
-
-                        ui.label(egui::RichText::new("Password").size(12.0).color(TEXT_SECONDARY));
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.password)
-                                .desired_width(320.0)
-                                .password(true)
-                                .hint_text("Enter your password")
-                                .margin(egui::Margin::symmetric(12.0, 10.0)),
-                        );
-                        ui.add_space(16.0);
-                    } else {
-                        // ── Step 2: Verification Code only ──
-                        ui.label(
-                            egui::RichText::new("Verification")
-                                .size(24.0)
-                                .color(TEXT_PRIMARY)
-                                .strong(),
-                        );
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Enter the code sent to your email")
-                                .size(13.0)
-                                .color(TEXT_SECONDARY),
-                        );
-                        ui.add_space(24.0);
-
-                        ui.label(egui::RichText::new("Verification Code").size(12.0).color(ACCENT));
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.verification_code)
-                                .desired_width(320.0)
-                                .hint_text("Enter code from email")
-                                .margin(egui::Margin::symmetric(12.0, 10.0)),
-                        );
-                        ui.add_space(16.0);
-                    }
-
-                    // Info message
-                    if !self.login_info.is_empty() {
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(0, 50, 70))
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::same(10.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(&self.login_info).size(12.0).color(ACCENT));
-                            });
-                        ui.add_space(8.0);
-                    }
-
-                    // Error message
-                    if !self.login_error.is_empty() {
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(60, 20, 20))
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::same(10.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(&self.login_error).size(12.0).color(ERROR_COLOR));
-                            });
-                        ui.add_space(8.0);
-                    }
-
-                    // Submit button
-                    ui.add_space(8.0);
-                    let button_text = if self.login_loading {
-                        if self.needs_2fa { "Verifying..." } else { "Signing in..." }
-                    } else if self.needs_2fa {
-                        "Verify"
-                    } else {
-                        "Sign In"
-                    };
-
-                    let can_submit = !self.login_loading && if self.needs_2fa {
-                        !self.verification_code.is_empty()
-                    } else {
-                        !self.username.is_empty() && !self.password.is_empty()
-                    };
-
-                    let btn = filled_button(button_text, can_submit)
-                        .min_size(egui::vec2(320.0, 42.0));
-
-                    let btn_response = ui.add_enabled(can_submit, btn);
-
-                    let enter_pressed = ui.input(|i: &egui::InputState| i.key_pressed(egui::Key::Enter));
-                    if (btn_response.clicked() || enter_pressed) && can_submit {
-                        self.attempt_login();
-                    }
-
-                    if btn_response.hovered() && can_submit {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                });
-        });
+        ui.add_space(16.0);
+        self.login.render(ui);
     }
 
     fn render_select_folders(&mut self, ui: &mut egui::Ui) {
         // Disk info bar
         if self.disk_total > 0 {
             let used = self.disk_total - self.disk_free;
-            let selected = self.selected_size();
+            let selected = self.tree.selected_size();
             let total_f = self.disk_total as f32;
 
             let bar_height = 14.0;
@@ -701,37 +367,18 @@ impl WizardApp {
         // Search + count
         ui.horizontal(|ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
+                egui::TextEdit::singleline(&mut self.tree.search_query)
                     .desired_width(200.0)
                     .hint_text("Search..."),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let count = self.selected_policies.len();
+                let count = self.tree.map_len();
                 ui.label(egui::RichText::new(format!("{count} item(s) selected")).size(12.0).color(TEXT_SECONDARY));
             });
         });
         ui.add_space(6.0);
 
-        if self.tree_loading && self.roots.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(40.0);
-                ui.spinner();
-                ui.label(egui::RichText::new("Loading folders...").size(14.0).color(TEXT_SECONDARY));
-            });
-            return;
-        }
-        if !self.tree_error.is_empty() {
-            ui.label(egui::RichText::new(&self.tree_error).color(ERROR_COLOR));
-            if ui.button("Retry").clicked() { self.fetch_roots(); }
-            return;
-        }
-
-        let mut actions = Vec::new();
-        let search = self.search_query.clone();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            render_tree(ui, &mut self.roots, &self.selected_policies, 0, &mut actions, &search);
-        });
-        self.process_tree_actions(actions);
+        let _ = self.tree.render(ui);
     }
 
     fn render_finish(&mut self, ui: &mut egui::Ui) {
@@ -752,8 +399,8 @@ impl WizardApp {
             ui.label(egui::RichText::new("Summary").size(14.0).color(TEXT_SECONDARY));
             ui.add_space(10.0);
 
-            let count = self.selected_policies.values().filter(|p| p.is_some()).count();
-            let total_size = self.selected_size();
+            let count = self.tree.build_selections().len();
+            let total_size = self.tree.selected_size();
 
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Folders:").size(13.0).color(TEXT_SECONDARY));
@@ -786,8 +433,7 @@ impl WizardApp {
     }
 
     fn render_syncing(&mut self, ui: &mut egui::Ui) {
-        // Start sync engine on first render of this step
-        self.start_sync();
+        // Note: start_sync() is called by WizardWrapper::update() AFTER config is saved to disk.
 
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
@@ -806,96 +452,200 @@ impl WizardApp {
             ui.add_space(16.0);
         });
 
-        // Live progress card
-        if let Ok(progress) = self.progress.lock() {
-            let phase = progress.phase.clone();
-            let files_done = progress.files_done;
-            let files_total = progress.files_total;
-            let current_folder = progress.current_folder.clone();
-            let current_file = progress.current_file.clone();
+        // Extract progress values (drop lock before rendering to avoid holding it across UI calls)
+        let (phase, files_done, files_total, files_failed, last_error, current_folder, current_file) =
+            if let Ok(p) = self.progress.lock() {
+                (p.phase.clone(), p.files_done, p.files_total, p.files_failed, p.last_error.clone(), p.current_folder.clone(), p.current_file.clone())
+            } else {
+                (SyncPhase::Idle, 0, 0, 0, None, String::new(), String::new())
+            };
 
-            card(ui, |ui| {
-                // Status header
-                ui.horizontal(|ui| {
-                    match &phase {
-                        SyncPhase::Idle => {
-                            // Green dot
-                            let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot_rect.center(), 5.0, SUCCESS_COLOR);
-                            ui.add_space(6.0);
-                            if files_done > 0 {
-                                ui.label(egui::RichText::new(format!("Up to date — {files_done} files synced")).size(14.0).color(SUCCESS_COLOR));
-                            } else {
-                                ui.label(egui::RichText::new("Waiting for sync cycle...").size(14.0).color(TEXT_SECONDARY));
-                            }
-                        }
-                        SyncPhase::Syncing => {
-                            ui.spinner();
-                            ui.label(egui::RichText::new("Syncing...").size(14.0).color(ACCENT));
-                        }
-                        SyncPhase::Error(e) => {
-                            let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot_rect.center(), 5.0, ERROR_COLOR);
-                            ui.add_space(6.0);
-                            ui.label(egui::RichText::new(format!("Error: {e}")).size(14.0).color(ERROR_COLOR));
+        // Detect completion: transition from Syncing → Idle (success/failure) or first Error
+        if self.last_phase == SyncPhase::Syncing && self.sync_banner.is_none() {
+            match &phase {
+                SyncPhase::Idle => {
+                    if files_failed > 0 {
+                        let err_msg = last_error.clone()
+                            .unwrap_or_else(|| format!("{files_failed} file(s) failed to download"));
+                        self.sync_banner = Some((false, files_done, err_msg));
+                    } else {
+                        self.sync_banner = Some((true, files_done, String::new()));
+                    }
+                }
+                SyncPhase::Error(e) => {
+                    self.sync_banner = Some((false, files_done, e.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.last_phase = phase.clone();
+
+        // Live progress card
+        card(ui, |ui| {
+            // Status header
+            ui.horizontal(|ui| {
+                match &phase {
+                    SyncPhase::Idle => {
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 5.0, SUCCESS_COLOR);
+                        ui.add_space(6.0);
+                        if files_done > 0 {
+                            ui.label(egui::RichText::new(format!("Up to date — {files_done} files synced")).size(14.0).color(SUCCESS_COLOR));
+                        } else {
+                            ui.label(egui::RichText::new("Waiting for sync cycle...").size(14.0).color(TEXT_SECONDARY));
                         }
                     }
-                });
-                ui.add_space(12.0);
-
-                // Progress bar
-                if files_total > 0 {
-                    let frac = files_done as f32 / files_total as f32;
-                    let bar_h = 8.0;
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), bar_h), egui::Sense::hover(),
-                    );
-                    let p = ui.painter();
-                    p.rect_filled(rect, 4.0, BAR_BG);
-                    let filled_w = rect.width() * frac.min(1.0);
-                    p.rect_filled(
-                        egui::Rect::from_min_size(rect.min, egui::vec2(filled_w, bar_h)),
-                        4.0, ACCENT,
-                    );
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", frac * 100.0))
-                                .size(13.0)
-                                .color(ACCENT)
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("  {files_done} / {files_total} files"))
-                                .size(12.0)
-                                .color(TEXT_SECONDARY),
-                        );
-                    });
-                }
-
-                // Current folder/file
-                if !current_folder.is_empty() {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        paint_folder_icon(ui, true);
+                    SyncPhase::Syncing => {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Syncing...").size(14.0).color(ACCENT));
+                    }
+                    SyncPhase::Error(e) => {
+                        let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 5.0, ERROR_COLOR);
                         ui.add_space(6.0);
-                        ui.label(egui::RichText::new(&current_folder).size(12.0).color(TEXT_PRIMARY));
-                    });
-                }
-                if !current_file.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.add_space(22.0);
-                        paint_file_icon(ui);
-                        ui.add_space(6.0);
-                        ui.label(egui::RichText::new(&current_file).size(11.0).color(TEXT_SECONDARY));
-                    });
+                        ui.label(egui::RichText::new(format!("Error: {e}")).size(14.0).color(ERROR_COLOR));
+                    }
                 }
             });
+            ui.add_space(12.0);
 
-            // Request repaint while actively syncing
-            if phase == SyncPhase::Syncing {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+            // Progress bar
+            if files_total > 0 {
+                // Give half-credit to the file being downloaded so the bar
+                // shows activity instead of sitting at 0% for the full download.
+                let frac = if !current_file.is_empty() {
+                    (files_done as f32 + 0.5) / files_total as f32
+                } else {
+                    files_done as f32 / files_total as f32
+                };
+                let bar_h = 8.0;
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), bar_h), egui::Sense::hover(),
+                );
+                let p = ui.painter();
+                p.rect_filled(rect, 4.0, BAR_BG);
+                let filled_w = rect.width() * frac.min(1.0);
+                p.rect_filled(
+                    egui::Rect::from_min_size(rect.min, egui::vec2(filled_w, bar_h)),
+                    4.0, ACCENT,
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{:.0}%", frac * 100.0))
+                            .size(13.0)
+                            .color(ACCENT)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("  {files_done} / {files_total} files"))
+                            .size(12.0)
+                            .color(TEXT_SECONDARY),
+                    );
+                });
             }
+
+            // Show download errors in red if any
+            if files_failed > 0 {
+                ui.add_space(8.0);
+                let err_text = if let Some(ref e) = last_error {
+                    format!("⚠ {files_failed} download error(s) — last: {e}")
+                } else {
+                    format!("⚠ {files_failed} download error(s)")
+                };
+                ui.label(egui::RichText::new(err_text).size(11.0).color(ERROR_COLOR));
+            }
+
+            // Current folder/file
+            if !current_folder.is_empty() {
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    paint_folder_icon(ui, true);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(&current_folder).size(12.0).color(TEXT_PRIMARY));
+                });
+            }
+            if !current_file.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    paint_file_icon(ui);
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(&current_file).size(11.0).color(TEXT_SECONDARY));
+                });
+            }
+        });
+
+        // Keep repainting until the completion banner is shown (covers the initial
+        // idle state before the engine wakes up as well as active downloading).
+        if self.sync_banner.is_none() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+        }
+
+        // ── Completion banner ──
+        if let Some((is_success, count, error)) = self.sync_banner.clone() {
+            ui.add_space(12.0);
+            let (accent_col, bg_col, icon, title) = if is_success {
+                (
+                    SUCCESS_COLOR,
+                    egui::Color32::from_rgba_premultiplied(15, 60, 30, 220),
+                    "\u{2714}", // ✔
+                    "Sync Complete!",
+                )
+            } else {
+                (
+                    ERROR_COLOR,
+                    egui::Color32::from_rgba_premultiplied(70, 15, 15, 220),
+                    "\u{26A0}", // ⚠
+                    "Sync Error",
+                )
+            };
+
+            let frame = egui::Frame::default()
+                .fill(bg_col)
+                .stroke(egui::Stroke::new(1.5, accent_col))
+                .rounding(egui::Rounding::same(10.0))
+                .inner_margin(egui::Margin::same(14.0));
+
+            frame.show(ui, |ui: &mut egui::Ui| {
+                ui.horizontal(|ui: &mut egui::Ui| {
+                    // Icon circle
+                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                    ui.painter().circle_filled(icon_rect.center(), 16.0, egui::Color32::from_rgba_premultiplied(
+                        accent_col.r() / 5, accent_col.g() / 5, accent_col.b() / 5, 180
+                    ));
+                    ui.painter().text(
+                        icon_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        icon,
+                        egui::FontId::proportional(16.0),
+                        accent_col,
+                    );
+                    ui.add_space(12.0);
+                    // Text block
+                    ui.vertical(|ui: &mut egui::Ui| {
+                        ui.label(egui::RichText::new(title).size(15.0).color(accent_col).strong());
+                        ui.add_space(2.0);
+                        if is_success {
+                            let file_word = if count == 1 { "file" } else { "files" };
+                            ui.label(
+                                egui::RichText::new(format!("{count} {file_word} downloaded and synced successfully."))
+                                    .size(12.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                        } else if !error.is_empty() {
+                            ui.label(egui::RichText::new(error.as_str()).size(12.0).color(TEXT_SECONDARY));
+                        } else {
+                            ui.label(egui::RichText::new("An error occurred during sync.").size(12.0).color(TEXT_SECONDARY));
+                        }
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("You can close this window — the app continues in the system tray.")
+                                .size(11.0)
+                                .color(TEXT_DISABLED),
+                        );
+                    });
+                });
+            });
         }
 
         // Disk space
@@ -928,15 +678,20 @@ impl eframe::App for WizardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         configure_visuals(ctx);
 
-        self.poll_login();
-        self.poll_tree();
+        // Poll login widget — advance the wizard as soon as auth succeeds.
+        if let Some(LoginOutcome::Success) = self.login.poll(ctx) {
+            info!("Login successful via wizard");
+            self.login_complete = true;
+            self.advance();
+        }
+        self.tree.poll(ctx);
 
         if self.done || self.cancelled {
             // Don't send viewport commands here — WizardWrapper handles exit via process::exit(0)
             // Sending Visible(false)/Close causes visual flashes before exit takes effect
             return;
         }
-        if self.login_loading || self.tree_loading {
+        if self.login.is_loading || self.tree.is_loading {
             ctx.request_repaint();
         }
 
@@ -1113,13 +868,13 @@ impl eframe::App for WizardApp {
 
                 // ── Navigation buttons (Material Design) ──
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    ui.add_space(4.0);
+                    ui.add_space(16.0);
 
                     ui.horizontal(|ui| {
                         if self.step == WizardStep::Syncing {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let close_btn = filled_button("Close & Continue in Tray", true)
-                                    .min_size(egui::vec2(220.0, 40.0));
+                                let close_btn = filled_button("Finish", true)
+                                    .min_size(egui::vec2(120.0, 40.0));
                                 if ui.add(close_btn).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                                     self.done = true;
                                 }
@@ -1170,21 +925,9 @@ impl eframe::App for WizardApp {
     }
 }
 
-/// Wizard result shared back to caller
-struct WizardResult {
-    completed: bool,
-    sync_folder: String,
-    selected_folders: Vec<FolderSelection>,
-    add_explorer_sidebar: bool,
-    create_desktop_shortcut: bool,
-    start_with_windows: bool,
-    /// If true, sync engine was already started inside the wizard
-    sync_already_started: bool,
-}
-
 /// Show the setup wizard. Blocks until user finishes or cancels.
-/// Returns the SharedProgress so caller can pass it to tray without re-creating the engine.
-pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime) -> (SharedProgress, bool) {
+/// Always calls `process::exit(0)` — never returns.
+pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime) {
     let handle = rt.handle().clone();
     let auth_clone = auth.clone();
     let config_snapshot = config.clone();
@@ -1203,8 +946,6 @@ pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
         ..Default::default()
     };
 
-    let result = Arc::new(std::sync::Mutex::new(None::<WizardResult>));
-    let result_clone = result.clone();
     let progress_clone = progress.clone();
 
     info!("Launching wizard eframe window...");
@@ -1214,7 +955,6 @@ pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
         Box::new(move |_cc| {
             Ok(Box::new(WizardWrapper {
                 inner: WizardApp::new(&config_snapshot, auth_clone, handle, progress_clone),
-                result: result_clone,
             }))
         }),
     );
@@ -1222,52 +962,13 @@ pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
         Ok(()) => info!("Wizard window closed normally"),
         Err(e) => error!("Wizard window error: {e}"),
     }
-
-    let mut sync_already_started = false;
-
-    // Apply wizard results to config
-    if let Ok(guard) = result.lock() {
-        info!("Wizard result: has_value={}", guard.is_some());
-        if let Some(ref res) = *guard {
-            info!("Wizard result: completed={}, folders={}, sync_started={}",
-                res.completed, res.selected_folders.len(), res.sync_already_started);
-            if res.completed {
-                config.sync_folder = res.sync_folder.clone();
-                config.selected_folders = res.selected_folders.clone();
-                config.auto_start = res.start_with_windows;
-                config.setup_complete = true;
-                sync_already_started = res.sync_already_started;
-
-                if let Err(e) = config.save() {
-                    error!("Failed to save config after wizard: {e}");
-                }
-                info!("Wizard completed: {} folders selected, sync folder: {}",
-                    config.selected_folders.len(), config.sync_folder);
-
-                // Create shortcuts
-                if res.add_explorer_sidebar {
-                    if let Err(e) = create_explorer_sidebar(&config.sync_folder) {
-                        error!("Explorer sidebar failed: {e}");
-                    }
-                }
-                if res.create_desktop_shortcut {
-                    if let Err(e) = create_desktop_shortcut(&config.sync_folder) {
-                        error!("Desktop shortcut failed: {e}");
-                    }
-                }
-                if let Err(e) = set_auto_start(res.start_with_windows) {
-                    error!("Auto-start setup failed: {e}");
-                }
-            }
-        }
-    }
-
-    (progress, sync_already_started)
+    // WizardWrapper::update() always calls process::exit(0) before GPU teardown.
+    // If we somehow reach this point, exit cleanly.
+    std::process::exit(0);
 }
 
 struct WizardWrapper {
     inner: WizardApp,
-    result: Arc<std::sync::Mutex<Option<WizardResult>>>,
 }
 
 impl eframe::App for WizardWrapper {
@@ -1288,6 +989,25 @@ impl eframe::App for WizardWrapper {
                 } else {
                     info!("Config saved to disk before sync start");
                 }
+            }
+            // Start sync engine NOW — config is already on disk so the engine reads correct selections.
+            self.inner.start_sync();
+
+            // Notify the user that setup completed successfully
+            let folder_count = self.inner.build_selections().len();
+            let body = format!(
+                "{} folder{} selected. Sync is running in the background.",
+                folder_count,
+                if folder_count == 1 { "" } else { "s" }
+            );
+            if let Err(e) = notify_rust::Notification::new()
+                .app_id(crate::ui::common::NOTIFICATION_APP_ID)
+                .summary("AGB Cloud Client — Setup Complete")
+                .body(&body)
+                .timeout(notify_rust::Timeout::Milliseconds(6000))
+                .show()
+            {
+                error!("Setup notification failed: {e}");
             }
         }
 
@@ -1320,6 +1040,8 @@ impl eframe::App for WizardWrapper {
                 if self.inner.add_explorer_sidebar {
                     if let Err(e) = create_explorer_sidebar(&cfg.sync_folder) {
                         error!("Explorer sidebar failed: {e}");
+                    } else if let Err(e) = restart_explorer() {
+                        error!("Explorer restart failed: {e}");
                     }
                 }
                 if self.inner.create_desktop_shortcut_opt {
@@ -1345,7 +1067,27 @@ impl eframe::App for WizardWrapper {
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 std::process::exit(0);
             } else {
-                // Cancelled — just exit
+                // Cancelled — run the NSIS silent uninstaller to clean up
+                // files, registry entries and shortcuts that were written
+                // before the wizard launched.
+                if let Ok(exe) = std::env::current_exe() {
+                    if let Some(install_dir) = exe.parent() {
+                        let uninstaller = install_dir.join("uninstall.exe");
+                        if uninstaller.exists() {
+                            info!("Setup cancelled — launching silent uninstaller");
+                            // /S = silent, no _?= so NSIS copies to %TEMP% and
+                            // can delete the original install directory.
+                            std::process::Command::new(&uninstaller)
+                                .arg("/S")
+                                .spawn()
+                                .ok();
+                            // Give the uninstaller time to start before we release the exe lock.
+                            std::thread::sleep(std::time::Duration::from_millis(800));
+                        } else {
+                            info!("Setup cancelled — no uninstaller found, exiting");
+                        }
+                    }
+                }
                 std::process::exit(0);
             }
         }

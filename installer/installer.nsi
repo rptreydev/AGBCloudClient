@@ -83,15 +83,36 @@ SectionEnd
 
 ; ── Uninstaller Section ──
 Section "Uninstall"
-    ; Kill running process before removing files (suppress output)
+    ; Ask the app to clean up shortcuts while it still has access to config
+    ; (sync folder path, credential store).  Removes Explorer nav entry,
+    ; desktop.ini folder icon, Desktop shortcut, and auto-start.
+    ; Use /WAIT so cleanup finishes before we kill the process or delete files.
+    nsExec::ExecToStack '"$INSTDIR\agb-cloud-client.exe" --uninstall'
+    Pop $0
+    Sleep 2000
+
+    ; Kill running tray/subprocess instances
     nsExec::ExecToStack 'taskkill /F /IM agb-cloud-client.exe'
     Pop $0
     Sleep 1000
 
-    ; Remove auto-start registry entry
+    ; ── Fallback shortcut cleanup (in case --uninstall failed) ──────────────
+
+    ; Auto-start registry entry
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "AGBCloudClient"
 
-    ; Remove installed files
+    ; Desktop shortcut ("AGB CloudFiles.lnk")
+    Delete "$DESKTOP\AGB CloudFiles.lnk"
+
+    ; Explorer nav pane CLSID entry
+    DeleteRegKey HKCU "Software\Classes\CLSID\{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}"
+    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}"
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\NewStartPanel" "{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}"
+
+    ; Toast notification AppUserModelId
+    DeleteRegKey HKCU "Software\Classes\AppUserModelId\AGBroadband.CloudClient"
+
+    ; ── Remove installed files ───────────────────────────────────────────────
     Delete "$INSTDIR\agb-cloud-client.exe"
     Delete "$INSTDIR\icon.ico"
     Delete "$INSTDIR\uninstall.exe"
@@ -102,13 +123,9 @@ Section "Uninstall"
     Delete "$SMPROGRAMS\${PRODUCT_PUBLISHER}\Uninstall ${PRODUCT_NAME}.lnk"
     RMDir "$SMPROGRAMS\${PRODUCT_PUBLISHER}"
 
-    ; Remove registry keys
+    ; Remove registry keys (Add/Remove Programs, install dir)
     DeleteRegKey ${PRODUCT_UNINST_ROOT_KEY} "${PRODUCT_UNINST_KEY}"
     DeleteRegKey HKLM "${PRODUCT_DIR_REGKEY}"
 
-    ; Remove Explorer sidebar CLSID (if created by app)
-    DeleteRegKey HKCU "Software\Classes\CLSID\{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}"
-    DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace\{2CC5E37B-3737-4C89-A1E7-23A99F4C0E00}"
-
-    ; Note: We do NOT remove user data (%APPDATA% config or sync folder)
+    ; Note: User content (sync folder files) and config (%APPDATA%) are preserved.
 SectionEnd
