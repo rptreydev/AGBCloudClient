@@ -30,10 +30,11 @@ impl RemoteClient {
         let url = format!("{}/cloud-file", self.auth.server_url());
         debug!("GET {url}");
 
-        let resp = self.auth.client()
-            .get(&url)
-            .send()
-            .await?;
+        let mut builder = self.auth.client().get(&url);
+        if let Some(token) = self.auth.get_token().await {
+            builder = builder.header("Cookie", format!("jwt={token}"));
+        }
+        let resp = builder.send().await?;
 
         let status = resp.status();
         let text = resp.text().await?;
@@ -61,10 +62,11 @@ impl RemoteClient {
         let url = format!("{}/cloud-file/{}", self.auth.server_url(), folder_uuid);
         debug!("GET {url}");
 
-        let resp = self.auth.client()
-            .get(&url)
-            .send()
-            .await?;
+        let mut builder = self.auth.client().get(&url);
+        if let Some(token) = self.auth.get_token().await {
+            builder = builder.header("Cookie", format!("jwt={token}"));
+        }
+        let resp = builder.send().await?;
 
         let status = resp.status();
         let text = resp.text().await?;

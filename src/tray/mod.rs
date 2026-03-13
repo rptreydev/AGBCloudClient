@@ -67,26 +67,28 @@ pub fn run_tray(
 ) {
     let mut is_auth = rt.block_on(auth.is_authenticated());
 
+    let (menu, menu_ids) = build_context_menu();
+
     // Retry tray icon creation — the notification area may not be fully
     // initialized if Explorer was just restarted.
-    let (menu, menu_ids, tray_icon) = {
+    let tray_icon = {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
             let icon = crate::ui::icon::tray_icon();
-            let (m, ids) = build_context_menu();
 
+            // NOTE: no .with_menu() — we show the menu manually on right-click only,
+            // which prevents the menu from also appearing on left-click.
             match TrayIconBuilder::new()
                 .with_tooltip("AGB Cloud Client — AGBroadband")
                 .with_icon(icon)
-                // No with_menu: left-click opens panel, right-click shows menu manually
                 .build()
             {
                 Ok(t) => {
                     if attempt > 1 {
                         info!("Tray icon created on attempt {attempt}");
                     }
-                    break (m, ids, t);
+                    break t;
                 }
                 Err(e) if attempt < 5 => {
                     warn!("Tray icon creation failed (attempt {attempt}/5): {e} — retrying in 1s");
@@ -156,57 +158,66 @@ pub fn run_tray(
                         button_state: MouseButtonState::Up,
                         ..
                     } => {
-                        info!("Tray right-click — showing context menu");
+                        // Show context menu manually on right-click only.
+                        // We create a tiny invisible WS_POPUP window on this thread so
+                        // that TrackPopupMenu (inside show_context_menu_for_hwnd) has a
+                        // valid owner and SetForegroundWindow can activate it properly.
                         unsafe {
                             use winapi::um::winuser::{
-                                GetCursorPos, GetDesktopWindow, SetForegroundWindow,
-                                TrackPopupMenu, PostMessageW, WM_NULL, TPM_LEFTALIGN, TPM_BOTTOMALIGN,
+                                CreateWindowExW, DestroyWindow, SetForegroundWindow,
+                                GetCursorPos, WS_POPUP, WS_EX_TOOLWINDOW,
                             };
                             use tray_icon::menu::ContextMenu as _;
                             let mut pt = winapi::shared::windef::POINT { x: 0, y: 0 };
                             GetCursorPos(&mut pt);
-                            let hwnd = GetDesktopWindow();
-                            SetForegroundWindow(hwnd);
-                            TrackPopupMenu(
-                                menu.hpopupmenu() as winapi::shared::windef::HMENU,
-                                TPM_LEFTALIGN | TPM_BOTTOMALIGN,
-                                pt.x, pt.y, 0, hwnd, std::ptr::null(),
+                            let cls: Vec<u16> = "STATIC\0".encode_utf16().collect();
+                            let hwnd = CreateWindowExW(
+                                WS_EX_TOOLWINDOW,
+                                cls.as_ptr(),
+                                std::ptr::null(),
+                                WS_POPUP,
+                                pt.x, pt.y, 1, 1,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut(),
                             );
-                            PostMessageW(hwnd, WM_NULL, 0, 0);
+                            if !hwnd.is_null() {
+                                SetForegroundWindow(hwnd);
+                                // show_context_menu_for_hwnd blocks until the menu is dismissed,
+                                // then queues a MenuEvent which we pick up below.
+                                menu.show_context_menu_for_hwnd(hwnd as isize, None);
+                                DestroyWindow(hwnd);
+                            }
                         }
                     }
                     _ => {}
                 }
             }
 
-            // Context menu item selected (right-click menu)
+            // Context menu item selected (queued by show_context_menu_for_hwnd above)
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == menu_ids.status {
                     info!("Menu: Open Status Panel");
-                    if is_auth {
-                        spawn_ui_subprocess("--status", &children);
-                    } else {
-                        spawn_login();
-                    }
+                    if is_auth { spawn_ui_subprocess("--status", &children); }
+                    else { spawn_login(); }
                 } else if event.id == menu_ids.folders {
                     info!("Menu: Manage Folders");
                     spawn_ui_subprocess("--manage-folders", &children);
                 } else if event.id == menu_ids.settings {
                     info!("Menu: Settings");
                     spawn_ui_subprocess("--settings", &children);
-                } else if event.id == menu_ids.logout {
-                    if is_auth {
-                        info!("Menu: Sign Out");
-                        let _ = rt.block_on(auth_clone.logout());
-                        if let Ok(exe) = std::env::current_exe() {
-                            if let Err(e) = std::process::Command::new(&exe).arg("--login").spawn() {
-                                error!("Failed to relaunch for sign-in: {e}");
-                            }
+                } else if event.id == menu_ids.logout && is_auth {
+                    info!("Menu: Sign Out");
+                    let _ = rt.block_on(auth_clone.logout());
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Err(e) = std::process::Command::new(&exe).arg("--login").spawn() {
+                            error!("Failed to relaunch for sign-in: {e}");
                         }
-                        kill_all_children(&children);
-                        drop(tray_icon);
-                        std::process::exit(0);
                     }
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
                 } else if event.id == menu_ids.quit {
                     info!("Menu: Quit");
                     kill_all_children(&children);
@@ -279,7 +290,6 @@ pub fn run_tray(
     #[cfg(not(target_os = "windows"))]
     {
         loop {
-            // Tray clicks: left → panel, right → context menu
             if let Ok(ev) = tray_channel.try_recv() {
                 match ev {
                     TrayIconEvent::Click {
@@ -301,15 +311,13 @@ pub fn run_tray(
                         button_state: MouseButtonState::Up,
                         ..
                     } => {
-                        let hwnd = unsafe { winapi::um::winuser::GetDesktopWindow() as isize };
                         use tray_icon::menu::ContextMenu as _;
-                        menu.show_context_menu_for_hwnd(hwnd, None);
+                        menu.show_context_menu_for_hwnd(0, None);
                     }
                     _ => {}
                 }
             }
 
-            // Context menu
             if let Ok(event) = menu_channel.try_recv() {
                 if event.id == menu_ids.status {
                     if is_auth { spawn_ui_subprocess("--status", &children); } else { spawn_login(); }

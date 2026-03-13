@@ -423,18 +423,20 @@ impl eframe::App for StatusPanel {
             .show(ctx, |ui| {
                 match self.active_tab {
                     BrowserTab::Folders => {
-                        // ── Folders tab: user card + sync status + synced folder list ──
+                        // ── Folders tab: fixed header + scrollable folder list ──
+                        // User card and status are fixed; only the folder cards scroll.
+                        ui.set_width(ui.available_width());
+                        self.render_user_card(ui);
+                        let r = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
+                        ui.painter().rect_filled(r, 0.0, DIVIDER);
+                        self.render_status(ui);
+                        let r = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
+                        ui.painter().rect_filled(r, 0.0, DIVIDER);
                         egui::ScrollArea::vertical()
                             .id_salt("sp_scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                self.render_user_card(ui);
-                                let r = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
-                                ui.painter().rect_filled(r, 0.0, DIVIDER);
-                                self.render_status(ui);
-                                let r = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
-                                ui.painter().rect_filled(r, 0.0, DIVIDER);
                                 self.render_folders(ui);
                             });
                     }
@@ -1091,13 +1093,8 @@ impl StatusPanel {
                         ui.cursor().min,
                         egui::vec2(ui.available_width(), est_h),
                     );
-                    let row_fill = if ui.ctx().pointer_hover_pos()
-                        .map(|p| approx_rect.contains(p)).unwrap_or(false)
-                    {
-                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 18)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
+                    let is_hovered = ui.ctx().pointer_hover_pos()
+                        .map(|p| approx_rect.contains(p)).unwrap_or(false);
 
                     let cached_tex: Option<egui::load::SizedTexture> = if is_img {
                         self.thumbnail_cache.get(&path)
@@ -1107,7 +1104,7 @@ impl StatusPanel {
 
                     let v_margin = if is_img { 5.0 } else { 8.0 };
                     let row_resp = egui::Frame::default()
-                        .fill(row_fill)
+                        .fill(if is_hovered { SURFACE_VARIANT } else { egui::Color32::TRANSPARENT })
                         .inner_margin(egui::Margin {
                             left: 14.0, right: 12.0, top: v_margin, bottom: v_margin,
                         })
@@ -1203,11 +1200,7 @@ impl StatusPanel {
 
                                     let tile_id = ui.id().with(("gt", idx as u32));
                                     let was_hov = ui.ctx().data(|d| d.get_temp::<bool>(tile_id)).unwrap_or(false);
-                                    let tile_fill = if was_hov {
-                                        SURFACE_VARIANT
-                                    } else {
-                                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 4)
-                                    };
+                                    let tile_fill = if was_hov { SURFACE_VARIANT } else { egui::Color32::TRANSPARENT };
 
                                     let tile_resp = egui::Frame::default()
                                         .fill(tile_fill)
@@ -1292,13 +1285,8 @@ impl StatusPanel {
                         ui.cursor().min,
                         egui::vec2(ui.available_width(), 34.0),
                     );
-                    let row_fill = if ui.ctx().pointer_hover_pos()
-                        .map(|p| approx_rect.contains(p)).unwrap_or(false)
-                    {
-                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 18)
-                    } else {
-                        egui::Color32::TRANSPARENT
-                    };
+                    let is_hovered_d = ui.ctx().pointer_hover_pos()
+                        .map(|p| approx_rect.contains(p)).unwrap_or(false);
 
                     let cached_tex: Option<egui::load::SizedTexture> = if is_img {
                         self.thumbnail_cache.get(&path)
@@ -1307,7 +1295,7 @@ impl StatusPanel {
                     } else { None };
 
                     let row_resp = egui::Frame::default()
-                        .fill(row_fill)
+                        .fill(if is_hovered_d { SURFACE_VARIANT } else { egui::Color32::TRANSPARENT })
                         .inner_margin(egui::Margin {
                             left: 14.0, right: 14.0, top: 5.0, bottom: 5.0,
                         })
