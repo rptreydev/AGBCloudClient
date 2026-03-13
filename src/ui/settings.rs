@@ -374,6 +374,12 @@ impl SettingsApp {
         egui::ScrollArea::vertical().show(ui, |ui| {
             section_header(ui, "Sync Folder");
             card(ui, |ui| {
+                ui.label(egui::RichText::new("Destination drive").size(12.0).color(TEXT_SECONDARY));
+                ui.add_space(6.0);
+                if let Some(new_path) = crate::ui::common::render_drive_picker(ui, &self.sync_folder) {
+                    self.sync_folder = new_path;
+                }
+                ui.add_space(10.0);
                 ui.label(egui::RichText::new("Local folder where files are downloaded:").size(12.0).color(TEXT_SECONDARY));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {

@@ -813,6 +813,65 @@ fn wait_for_shell_tray_wnd(timeout_ms: u64) {
 #[cfg(not(target_os = "windows"))]
 fn wait_for_shell_tray_wnd(_timeout_ms: u64) {}
 
+/// Returns the primary monitor's dimensions in physical pixels.
+/// Used to clamp window sizes so they fit on smaller screens.
+/// Falls back to 1920×1080 if detection fails.
+#[cfg(target_os = "windows")]
+pub fn primary_monitor_size() -> (f32, f32) {
+    use winapi::um::winuser::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    unsafe {
+        let w = GetSystemMetrics(SM_CXSCREEN);
+        let h = GetSystemMetrics(SM_CYSCREEN);
+        if w > 0 && h > 0 { (w as f32, h as f32) } else { (1920.0, 1080.0) }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn primary_monitor_size() -> (f32, f32) { (1920.0, 1080.0) }
+
+/// Returns the Windows work area `(left, top, right, bottom)` in physical pixels.
+/// The work area is the screen minus the taskbar — use this to position windows
+/// so they appear just above the taskbar (iCloud-style bottom-right panel).
+#[cfg(target_os = "windows")]
+pub fn work_area() -> (f32, f32, f32, f32) {
+    use winapi::shared::windef::RECT;
+    use winapi::um::winuser::{SystemParametersInfoW, SPI_GETWORKAREA};
+    let mut r = RECT { left: 0, top: 0, right: 1920, bottom: 1040 };
+    unsafe {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut r as *mut _ as *mut _, 0);
+    }
+    (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn work_area() -> (f32, f32, f32, f32) {
+    let (w, h) = primary_monitor_size();
+    (0.0, 0.0, w, h - 48.0)
+}
+
+/// Find a window by its title and bring it to the foreground.
+/// Used to activate an already-running subprocess window instead of spawning a duplicate.
+#[cfg(target_os = "windows")]
+pub fn activate_window_by_title(title: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::winuser::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    let wide: Vec<u16> = OsStr::new(title)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), wide.as_ptr());
+        if !hwnd.is_null() {
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn activate_window_by_title(_title: &str) {}
+
 pub fn create_desktop_shortcut(sync_folder: &str) -> anyhow::Result<()> {
     std::fs::create_dir_all(sync_folder)?;
     let user_dirs = directories::UserDirs::new()
@@ -940,6 +999,202 @@ pub fn register_notification_app_id() {
 /// The AppUserModelID used for Windows toast notifications.
 /// Must match the AUMID registered by [`register_notification_app_id`].
 pub const NOTIFICATION_APP_ID: &str = "AGBroadband.CloudClient";
+
+// ── Drive enumeration ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DriveKind {
+    Fixed,
+    Removable,
+    Network,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct DriveInfo {
+    pub letter: String,      // "C:", "D:", "Z:"
+    pub label: String,       // Volume label or "" if empty
+    pub kind: DriveKind,
+    #[allow(dead_code)]
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub available: bool,     // false if GetDiskFreeSpaceExW fails
+}
+
+impl DriveInfo {
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            DriveKind::Fixed     => "Local",
+            DriveKind::Removable => "Removable",
+            DriveKind::Network   => "Network",
+            DriveKind::Unknown   => "Drive",
+        }
+    }
+}
+
+/// Enumerate all logical drives using Windows API.
+/// Returns an empty vec on non-Windows or if the API call fails.
+#[cfg(target_os = "windows")]
+pub fn enumerate_drives() -> Vec<DriveInfo> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use winapi::um::fileapi::{GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW};
+    // Drive type constants defined in winapi::um::fileapi
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32     = 3;
+    const DRIVE_REMOTE: u32    = 4;
+
+    let mask = unsafe { GetLogicalDrives() };
+    let mut drives = Vec::new();
+    for bit in 0u32..26 {
+        if mask & (1 << bit) == 0 {
+            continue;
+        }
+        let letter = (b'A' + bit as u8) as char;
+        let root: Vec<u16> = format!("{}:\\\0", letter).encode_utf16().collect();
+        let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
+        // Skip: 0 = unknown path, 1 = no root dir, 5 = CD-ROM, 6 = RAM disk
+        if drive_type <= 1 || drive_type == 5 || drive_type == 6 {
+            continue;
+        }
+        let kind = match drive_type {
+            DRIVE_FIXED     => DriveKind::Fixed,
+            DRIVE_REMOVABLE => DriveKind::Removable,
+            DRIVE_REMOTE    => DriveKind::Network,
+            _               => DriveKind::Unknown,
+        };
+        // Volume label
+        let mut lbl = [0u16; 256];
+        unsafe {
+            GetVolumeInformationW(
+                root.as_ptr(), lbl.as_mut_ptr(), 256,
+                std::ptr::null_mut(), std::ptr::null_mut(),
+                std::ptr::null_mut(), std::ptr::null_mut(), 0,
+            );
+        }
+        let label = OsString::from_wide(&lbl)
+            .to_string_lossy()
+            .trim_end_matches('\0')
+            .to_string();
+        // Disk space
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let available = unsafe {
+            GetDiskFreeSpaceExW(
+                root.as_ptr(),
+                &mut free  as *mut u64 as *mut _,
+                &mut total as *mut u64 as *mut _,
+                std::ptr::null_mut(),
+            ) != 0
+        };
+        drives.push(DriveInfo {
+            letter: format!("{}:", letter),
+            label,
+            kind,
+            total_bytes: total,
+            free_bytes: free,
+            available,
+        });
+    }
+    drives
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn enumerate_drives() -> Vec<DriveInfo> {
+    vec![]
+}
+
+/// Render a horizontal row of drive-selection cards.
+/// Returns `Some(path)` (e.g. `"D:\\CloudFiles"`) when the user clicks a drive,
+/// `None` if no click occurred or if no drives are found.
+pub fn render_drive_picker(ui: &mut egui::Ui, current_path: &str) -> Option<String> {
+    let drives = enumerate_drives();
+    if drives.is_empty() {
+        return None;
+    }
+    let current_letter = drive_letter(current_path);
+    let mut selected = None;
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+        for d in &drives {
+            let is_cur = d.letter == current_letter;
+            let card_fill   = if is_cur { ACCENT_DIM }      else { SURFACE_VARIANT };
+            let card_stroke = if is_cur { ACCENT }           else { DIVIDER };
+            let free_gb     = d.free_bytes as f64 / 1_073_741_824.0;
+
+            // Drive display name
+            let name_line = if d.label.is_empty() {
+                d.letter.clone()
+            } else if d.label.len() > 10 {
+                // Truncate long labels
+                format!("{}\n{}…", d.letter, &d.label[..9])
+            } else {
+                format!("{}\n{}", d.letter, d.label)
+            };
+
+            let r = egui::Frame::default()
+                .fill(card_fill)
+                .stroke(egui::Stroke::new(1.5, card_stroke))
+                .rounding(8.0)
+                .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 8.0, bottom: 8.0 })
+                .show(ui, |ui| {
+                    ui.set_width(86.0);
+                    ui.vertical_centered(|ui| {
+                        // Kind badge instead of emoji
+                        let kind_color = match d.kind {
+                            DriveKind::Network   => ACCENT,
+                            DriveKind::Removable => WARNING_COLOR,
+                            _                    => TEXT_SECONDARY,
+                        };
+                        ui.label(
+                            egui::RichText::new(d.kind_label())
+                                .size(9.0)
+                                .color(kind_color),
+                        );
+                        ui.label(
+                            egui::RichText::new(&name_line)
+                                .size(12.0)
+                                .color(TEXT_PRIMARY)
+                                .strong(),
+                        );
+                        if d.available {
+                            ui.label(
+                                egui::RichText::new(format!("{:.0} GB free", free_gb))
+                                    .size(10.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new("Unavailable")
+                                    .size(10.0)
+                                    .color(ERROR_COLOR),
+                            );
+                        }
+                    });
+                });
+
+            // Use ui.interact() with a stable, drive-letter-keyed ID so that press and
+            // release events on the same card are correctly associated across frames.
+            // r.response.interact(Sense::click()) uses an auto-generated Frame ID that
+            // is not guaranteed stable, causing missed or spurious click detections.
+            let card_resp = ui.interact(
+                r.response.rect,
+                ui.id().with((&d.letter, "drive_card")),
+                egui::Sense::click(),
+            );
+            if card_resp
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+                && d.available
+                && !is_cur
+            {
+                selected = Some(format!("{}\\CloudFiles", d.letter));
+            }
+        }
+    });
+    selected
+}
 
 /// Enable or disable auto-start with Windows via the Run registry key.
 pub fn set_auto_start(enable: bool) -> anyhow::Result<()> {

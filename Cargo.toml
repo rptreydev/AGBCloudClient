@@ -1,6 +1,6 @@
 [package]
 name = "agb-cloud-client"
-version = "0.1.0-beta"
+version = "0.1.0-beta.1"
 edition = "2024"
 description = "AGB Cloud Client — AGBroadband Desktop Sync Client"
 authors = ["AGBroadband"]
@@ -30,9 +30,9 @@ egui = "0.30"
 egui_extras = { version = "0.30", features = ["image"] }
 tray-icon = "0.19"
 rust_socketio = { version = "0.6", features = ["async"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
 rfd = "0.15"
-winapi = { version = "0.3", features = ["winuser", "shellapi", "fileapi", "minwindef"] }
+winapi = { version = "0.3", features = ["winuser", "shellapi", "fileapi", "minwindef", "winbase"] }
 notify-rust = "4"
 
 [build-dependencies]

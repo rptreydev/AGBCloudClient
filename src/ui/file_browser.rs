@@ -144,6 +144,11 @@ impl eframe::App for FileBrowserApp {
                                         tracing::error!("Failed to save folder selections: {e}");
                                     } else {
                                         info!("Folder selections saved to config ({} items)", self.saved_selections.len());
+                                        // Signal the tray process to trigger an immediate sync cycle.
+                                        // The tray polls progress.json every ~5 s and calls Notify::notify_one().
+                                        let mut prog = crate::sync::progress::read_progress_file();
+                                        prog.sync_requested = true;
+                                        crate::sync::progress::write_progress_file(&prog);
                                     }
                                 }
                                 Err(e) => tracing::error!("Failed to load config for save: {e}"),

@@ -50,15 +50,22 @@ fn main() {
     let force_setup = args.contains(&"--setup".to_string());
     let manage_folders_mode = args.contains(&"--manage-folders".to_string());
     let settings_mode = args.contains(&"--settings".to_string());
+    // Opens the iCloud-style live status panel (spawned from tray).
+    let status_mode = args.contains(&"--status".to_string());
     // Spawned by the tray after logout — shows login without requiring setup wizard.
     // Also bypasses the SingleInstance check to avoid a race condition where the
     // new process starts before the old tray process has released the mutex lock.
     let login_mode = args.contains(&"--login".to_string());
     // Called by the NSIS uninstaller before removing files — cleans up shortcuts.
     let uninstall_mode = args.contains(&"--uninstall".to_string());
+    // Spawned by the setup wizard on completion.  Skips SingleInstance because the
+    // wizard process (which holds the mutex) sleeps 800ms then exits — without this
+    // flag the fresh tray would detect "another instance running" and exit immediately,
+    // causing the tray icon to never appear after first-time setup.
+    let from_wizard = args.contains(&"--from-wizard".to_string());
 
     // Single-instance check (skip during special UI modes — they run as subprocesses)
-    let _instance = if !force_setup && !manage_folders_mode && !settings_mode && !login_mode && !uninstall_mode {
+    let _instance = if !force_setup && !manage_folders_mode && !settings_mode && !status_mode && !login_mode && !uninstall_mode && !from_wizard {
         let inst = SingleInstance::new("agb-cloud-client-agbroadband")
             .expect("Failed to create instance lock");
         if !inst.is_single() {
@@ -81,10 +88,11 @@ fn main() {
         config.server_url = server;
     }
 
-    // Handle --uninstall (called by NSIS before removing files)
-    // Removes shortcuts and Explorer nav entry; does NOT touch user content.
+    // Handle --uninstall (called by NSIS before removing files).
+    // Removes shortcuts, Explorer nav entry, auto-start, and all saved credentials.
+    // The NSIS uninstaller then deletes %APPDATA%/%LOCALAPPDATA% data directories.
     if uninstall_mode {
-        info!("Uninstall cleanup — removing shortcuts");
+        info!("Uninstall cleanup — removing shortcuts and credentials");
 
         // Only restart Explorer if the sidebar CLSID was actually registered.
         // If the user cancelled setup before the wizard completed, the sidebar
@@ -101,6 +109,15 @@ fn main() {
         ui::common::remove_explorer_sidebar(&config.sync_folder).ok();
         ui::common::remove_desktop_shortcut().ok();
         ui::common::set_auto_start(false).ok();
+
+        // Delete all credentials from Windows Credential Manager so no tokens remain
+        // after uninstall.  clear_all() deletes JWT, refresh token, password, and
+        // the last-username entry.  Errors are non-fatal — NSIS removes the files
+        // regardless.
+        match auth::store::CredentialStore::clear_all() {
+            Ok(()) => info!("Credentials cleared from Windows Credential Manager"),
+            Err(e) => warn!("Could not clear credentials (non-fatal): {e}"),
+        }
 
         if sidebar_was_registered {
             info!("Explorer sidebar was registered — restarting Explorer");
@@ -139,6 +156,14 @@ fn main() {
     // Handle --manage-folders (subprocess launched from tray)
     if manage_folders_mode {
         info!("Manage folders subprocess started");
+        // Single-instance guard: if already open, bring existing window to front
+        let _mf_lock = SingleInstance::new("agb-cloud-manage-folders-v1")
+            .expect("Failed to create manage-folders lock");
+        if !_mf_lock.is_single() {
+            info!("Manage Folders already open — activating existing window");
+            ui::common::activate_window_by_title("AGB Cloud Client - Select Folders");
+            std::process::exit(0);
+        }
         let restored = rt.block_on(auth_state.try_restore_session());
         if !restored {
             info!("Session restore failed — showing login");
@@ -162,6 +187,14 @@ fn main() {
     // Handle --settings (subprocess launched from tray)
     if settings_mode {
         info!("Settings subprocess started");
+        // Single-instance guard: if already open, bring existing window to front
+        let _st_lock = SingleInstance::new("agb-cloud-settings-v1")
+            .expect("Failed to create settings lock");
+        if !_st_lock.is_single() {
+            info!("Settings already open — activating existing window");
+            ui::common::activate_window_by_title("AGB Cloud Client - Settings");
+            std::process::exit(0);
+        }
         let restored = rt.block_on(auth_state.try_restore_session());
         if !restored {
             info!("Session restore failed — showing login");
@@ -180,6 +213,36 @@ fn main() {
             sync::SyncProgress::default(),
         ));
         ui::show_settings_window(&mut config, &auth_state, &rt, &progress);
+        std::process::exit(0);
+    }
+
+    // Handle --status (status panel subprocess launched from tray)
+    if status_mode {
+        info!("Status panel subprocess started");
+        // Single-instance guard: if already open, bring existing window to front
+        let _sp_lock = SingleInstance::new("agb-cloud-status-panel-v1")
+            .expect("Failed to create status-panel lock");
+        if !_sp_lock.is_single() {
+            info!("Status panel already open — activating existing window");
+            ui::common::activate_window_by_title("AGB Cloud Client \u{2014} Status");
+            std::process::exit(0);
+        }
+        let restored = rt.block_on(auth_state.try_restore_session());
+        if !restored {
+            info!("Session restore failed — showing login");
+            notify_rust::Notification::new()
+                .app_id(ui::common::NOTIFICATION_APP_ID)
+                .summary("AGB Cloud Client — Sign in Required")
+                .body("Please sign in to view sync status.")
+                .timeout(notify_rust::Timeout::Milliseconds(4000))
+                .show()
+                .ok();
+            // On success: spawn a fresh --status process (credentials now stored).
+            ui::show_login_window(&auth_state, &rt, Some(vec!["--status".to_string()]));
+            std::process::exit(0);
+        }
+        ui::show_status_panel(&auth_state, &rt);
+        // show_status_panel always calls exit(0), so this line is unreachable.
         std::process::exit(0);
     }
 
@@ -229,13 +292,18 @@ fn main() {
         config.selected_folders.len()
     );
 
+    // Shared trigger: allows the tray (polling progress.json) to wake the engine
+    // early when the user saves new folder selections in Manage Folders.
+    let sync_trigger = std::sync::Arc::new(tokio::sync::Notify::new());
+
     // Spawn background sync engine
     {
         let sync_auth = auth_state.clone();
         let sync_progress = progress.clone();
+        let engine_trigger = sync_trigger.clone();
         rt.spawn(async move {
             let engine = sync::SyncEngine::new(sync_auth, sync_progress);
-            engine.run().await;
+            engine.run(engine_trigger).await;
         });
     }
 
@@ -250,7 +318,7 @@ fn main() {
 
     // Run system tray on the main thread (blocks with Windows message pump)
     info!("Starting system tray...");
-    tray::run_tray(&auth_state, &config, &rt, progress);
+    tray::run_tray(&auth_state, &config, &rt, progress, sync_trigger);
     info!("Tray exited — shutting down");
 }
 

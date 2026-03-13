@@ -131,8 +131,11 @@ impl WizardApp {
             WizardStep::Welcome => true,
             WizardStep::SyncFolder => !self.sync_folder.is_empty(),
             WizardStep::Login => self.login_complete,
+            // Require at least 1 real folder selection before advancing.
             WizardStep::SelectFolders => self.tree.has_real_selection(),
-            WizardStep::Finish => true,
+            // Also guard the Finish step — belt-and-suspenders in case the user went
+            // Back, deselected everything, then tried clicking "Finish Setup".
+            WizardStep::Finish => self.tree.has_real_selection(),
             WizardStep::Syncing => false,
         }
     }
@@ -180,8 +183,9 @@ impl WizardApp {
         let auth = self.auth.clone();
         let progress = self.progress.clone();
         self.handle.spawn(async move {
+            // Wizard engine uses a local Notify — no external trigger needed during setup.
             let engine = SyncEngine::new(auth, progress);
-            engine.run().await;
+            engine.run(std::sync::Arc::new(tokio::sync::Notify::new())).await;
         });
         info!("Wizard: sync engine started");
     }
@@ -193,8 +197,9 @@ impl WizardApp {
     // ── Step renderers ──
 
     fn render_welcome(&mut self, ui: &mut egui::Ui) {
+        let avail_h = ui.available_height();
         ui.vertical_centered(|ui| {
-            ui.add_space(40.0);
+            ui.add_space((avail_h * 0.08).clamp(12.0, 40.0));
 
             ui.label(
                 egui::RichText::new("AGBroadband")
@@ -220,7 +225,7 @@ impl WizardApp {
                     ui.label(egui::RichText::new(version_text).size(11.0).color(TEXT_SECONDARY));
                 });
 
-            ui.add_space(32.0);
+            ui.add_space((avail_h * 0.06).clamp(10.0, 32.0));
 
             ui.label(
                 egui::RichText::new("Set up file synchronization between\nyour computer and AGBroadband Cloud Files.")
@@ -228,7 +233,7 @@ impl WizardApp {
                     .color(TEXT_SECONDARY),
             );
 
-            ui.add_space(28.0);
+            ui.add_space((avail_h * 0.05).clamp(8.0, 28.0));
         });
 
         // Steps preview card
@@ -274,6 +279,14 @@ impl WizardApp {
         ui.add_space(20.0);
 
         card(ui, |ui| {
+            // Drive quick-select
+            ui.label(egui::RichText::new("Destination drive").size(12.0).color(TEXT_SECONDARY));
+            ui.add_space(6.0);
+            if let Some(new_path) = crate::ui::common::render_drive_picker(ui, &self.sync_folder) {
+                self.sync_folder = new_path;
+                self.last_disk_path = String::new(); // force disk space refresh
+            }
+            ui.add_space(14.0);
             ui.label(egui::RichText::new("Location").size(12.0).color(TEXT_SECONDARY));
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -394,17 +407,19 @@ impl WizardApp {
             ui.add_space(16.0);
         });
 
+        // Compute outside closures so the value is accessible for the warning below.
+        let folder_count = self.tree.build_selections().len();
+        let total_size = self.tree.selected_size();
+
         // Summary card
         card(ui, |ui| {
             ui.label(egui::RichText::new("Summary").size(14.0).color(TEXT_SECONDARY));
             ui.add_space(10.0);
 
-            let count = self.tree.build_selections().len();
-            let total_size = self.tree.selected_size();
-
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Folders:").size(13.0).color(TEXT_SECONDARY));
-                ui.label(egui::RichText::new(format!("{count}")).size(13.0).color(TEXT_PRIMARY));
+                let folder_color = if folder_count == 0 { ERROR_COLOR } else { TEXT_PRIMARY };
+                ui.label(egui::RichText::new(format!("{folder_count}")).size(13.0).color(folder_color));
             });
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -417,6 +432,23 @@ impl WizardApp {
                 ui.label(egui::RichText::new(&self.sync_folder).size(13.0).color(TEXT_PRIMARY));
             });
         });
+
+        // Warn if no folders selected (Finish Setup button will be disabled)
+        if folder_count == 0 {
+            ui.add_space(8.0);
+            egui::Frame::default()
+                .fill(egui::Color32::from_rgba_premultiplied(80, 30, 10, 200))
+                .stroke(egui::Stroke::new(1.0, ERROR_COLOR))
+                .rounding(8.0)
+                .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 8.0 })
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("No folders selected. Go back to Select Folders to choose what to sync.")
+                            .size(12.0)
+                            .color(ERROR_COLOR),
+                    );
+                });
+        }
 
         ui.add_space(12.0);
 
@@ -735,12 +767,20 @@ impl eframe::App for WizardApp {
                             egui::Color32::TRANSPARENT
                         };
                         ui.painter().rect_filled(close_r.rect, 6.0, bg);
-                        ui.painter().text(
-                            close_r.rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "\u{2715}",
-                            egui::FontId::proportional(13.0),
-                            if hover { TEXT_PRIMARY } else { TEXT_DISABLED },
+                        // Draw X with painter lines — \u{2715} is not in egui's bundled font.
+                        // Use TEXT_SECONDARY (not TEXT_DISABLED) for the idle state:
+                        // TEXT_DISABLED (rgb 80,95,115) is nearly invisible on TITLE_BAR_BG (rgb 12,16,24).
+                        let c = close_r.rect.center();
+                        let s = 5.0_f32;
+                        let col = if hover { egui::Color32::WHITE } else { TEXT_SECONDARY };
+                        let stroke = egui::Stroke::new(2.0, col);
+                        ui.painter().line_segment(
+                            [egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)],
+                            stroke,
+                        );
+                        ui.painter().line_segment(
+                            [egui::pos2(c.x + s, c.y - s), egui::pos2(c.x - s, c.y + s)],
+                            stroke,
                         );
                         if hover {
                             ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -854,17 +894,24 @@ impl eframe::App for WizardApp {
                 let nav_height = 56.0;
                 let content_max = content_rect.height() - nav_height;
 
-                // Content area
-                ui.allocate_ui(egui::vec2(content_rect.width(), content_max), |ui| {
-                    match self.step {
-                        WizardStep::Welcome => self.render_welcome(ui),
-                        WizardStep::SyncFolder => self.render_sync_folder(ui),
-                        WizardStep::Login => self.render_login(ui),
-                        WizardStep::SelectFolders => self.render_select_folders(ui),
-                        WizardStep::Finish => self.render_finish(ui),
-                        WizardStep::Syncing => self.render_syncing(ui),
-                    }
-                });
+                // Content area — wrapped in ScrollArea so content is accessible
+                // even when the window is resized smaller than its ideal height.
+                egui::ScrollArea::vertical()
+                    .id_salt("wizard_content_scroll")
+                    .auto_shrink([false, false])
+                    .max_height(content_max)
+                    .show(ui, |ui| {
+                        ui.allocate_ui(egui::vec2(content_rect.width(), content_max), |ui| {
+                            match self.step {
+                                WizardStep::Welcome => self.render_welcome(ui),
+                                WizardStep::SyncFolder => self.render_sync_folder(ui),
+                                WizardStep::Login => self.render_login(ui),
+                                WizardStep::SelectFolders => self.render_select_folders(ui),
+                                WizardStep::Finish => self.render_finish(ui),
+                                WizardStep::Syncing => self.render_syncing(ui),
+                            }
+                        });
+                    });
 
                 // ── Navigation buttons (Material Design) ──
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
@@ -935,10 +982,19 @@ pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
         crate::sync::SyncProgress::default(),
     ));
 
+    // Clamp window size to 88% of the primary monitor so the wizard fits on
+    // small screens (laptops, secondary monitors, etc.).
+    let (sw, sh) = crate::ui::common::primary_monitor_size();
+    let win_w = 700.0_f32.min(sw * 0.88);
+    let win_h = 580.0_f32.min(sh * 0.88);
+    let min_w = 480.0_f32.min(win_w);
+    let min_h = 400.0_f32.min(win_h);
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([700.0, 580.0])
-            .with_min_inner_size([550.0, 450.0])
+            .with_inner_size([win_w, win_h])
+            .with_min_inner_size([min_w, min_h])
+            .with_resizable(true)
             .with_title("AGB Cloud Client — Setup Wizard (Beta)")
             .with_decorations(false)
             .with_transparent(false)
@@ -955,6 +1011,7 @@ pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
         Box::new(move |_cc| {
             Ok(Box::new(WizardWrapper {
                 inner: WizardApp::new(&config_snapshot, auth_clone, handle, progress_clone),
+                hide_sent: false,
             }))
         }),
     );
@@ -969,6 +1026,9 @@ pub fn show_setup_wizard(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
 
 struct WizardWrapper {
     inner: WizardApp,
+    /// True once we've sent Visible(false) — lets winit process it before
+    /// we do any blocking work (reg delete, Explorer restart, etc.).
+    hide_sent: bool,
 }
 
 impl eframe::App for WizardWrapper {
@@ -1012,8 +1072,15 @@ impl eframe::App for WizardWrapper {
         }
 
         if self.inner.done || self.inner.cancelled {
-            // Hide window immediately to prevent flash/blank frame
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Frame 1: send Visible(false) and return so winit processes it.
+            // Frame 2: do the actual cleanup (blocking ops, Explorer restart, etc.)
+            // Without this two-frame split the window stays visible/frozen during cleanup.
+            if !self.hide_sent {
+                self.hide_sent = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                ctx.request_repaint(); // ensure we get a frame 2 immediately
+                return;
+            }
 
             let completed = self.inner.done && !self.inner.cancelled;
             let selections = self.inner.build_selections();
@@ -1053,43 +1120,124 @@ impl eframe::App for WizardWrapper {
                     error!("Auto-start setup failed: {e}");
                 }
 
-                // Relaunch app in tray mode (without --setup)
+                // Relaunch app in tray mode.
+                // Use --from-wizard to skip the SingleInstance check: the current
+                // process still holds the mutex (we exit 800ms later), so without
+                // this flag the fresh tray would detect "another instance running"
+                // and exit immediately — the tray icon would never appear.
                 if let Ok(exe) = std::env::current_exe() {
                     info!("Relaunching app for tray mode: {}", exe.display());
-                    match std::process::Command::new(&exe).spawn() {
+                    match std::process::Command::new(&exe).arg("--from-wizard").spawn() {
                         Ok(_) => info!("Relaunch successful"),
                         Err(e) => error!("Relaunch failed: {e}"),
                     }
                 }
 
-                // Give the log writer time to flush, then exit.
-                // We skip eframe's GPU teardown which crashes on some machines.
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                // Give the tray process time to initialize before the wizard
+                // releases its resources (GPU context, tokio runtime, etc.).
+                // Using 800ms so the tray's first Shell_NotifyIcon call has
+                // a clean environment even under heavy sync load.
+                std::thread::sleep(std::time::Duration::from_millis(800));
                 std::process::exit(0);
             } else {
-                // Cancelled — run the NSIS silent uninstaller to clean up
-                // files, registry entries and shortcuts that were written
-                // before the wizard launched.
+                // Cancelled — remove every trace of the installation.
+                //
+                // The installer now uses %LOCALAPPDATA% (no admin required), so we
+                // can clean up all registry entries, shortcuts, credentials, and the
+                // install directory from user-space — no second UAC prompt needed.
+                info!("Setup cancelled — removing all installation traces");
+
+                // 1. Clear any credentials written during the Login step
+                let _ = crate::auth::store::CredentialStore::clear_all();
+
+                // 2. Clear user-space settings that may have been touched
+                let _ = crate::ui::common::set_auto_start(false);
+                let _ = crate::ui::common::remove_desktop_shortcut();
+
+                // 3. Delete HKCU registry entries written by NSIS.
+                //    Use spawn() (non-blocking) — the batch file (step 6) also
+                //    does this, but an early non-blocking fire-and-forget is fine.
+                for key in &[
+                    r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\AGBCloudClient",
+                    r"HKCU\Software\AGBroadband\AGBCloudClient",
+                ] {
+                    let _ = std::process::Command::new("reg")
+                        .args(["delete", key, "/f"])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+
+                // 4. Remove Start Menu shortcuts created by NSIS
+                if let Ok(appdata) = std::env::var("APPDATA") {
+                    let sm = std::path::PathBuf::from(appdata)
+                        .join(r"Microsoft\Windows\Start Menu\Programs\AGBroadband");
+                    let _ = std::fs::remove_dir_all(sm);
+                }
+
+                // 5. Remove app config/data from %APPDATA% (may have been created
+                //    by AppConfig::load_or_create() during wizard startup)
+                if let Some(dirs) =
+                    directories::ProjectDirs::from("com", "AGBroadband", "AGBCloudClient")
+                {
+                    let _ = std::fs::remove_dir_all(dirs.config_dir());
+                }
+
+                // 6. Schedule deletion of %LOCALAPPDATA%\AGBroadband\AGBCloudClient.
+                //    The running exe cannot delete itself; a background batch waits
+                //    until the process exits then removes the entire install dir.
                 if let Ok(exe) = std::env::current_exe() {
                     if let Some(install_dir) = exe.parent() {
-                        let uninstaller = install_dir.join("uninstall.exe");
-                        if uninstaller.exists() {
-                            info!("Setup cancelled — launching silent uninstaller");
-                            // /S = silent, no _?= so NSIS copies to %TEMP% and
-                            // can delete the original install directory.
-                            std::process::Command::new(&uninstaller)
-                                .arg("/S")
-                                .spawn()
-                                .ok();
-                            // Give the uninstaller time to start before we release the exe lock.
-                            std::thread::sleep(std::time::Duration::from_millis(800));
-                        } else {
-                            info!("Setup cancelled — no uninstaller found, exiting");
+                        // Safety: only auto-delete if this is the expected install path
+                        let path_lc = install_dir.to_string_lossy().to_lowercase();
+                        if path_lc.contains("localappdata") && path_lc.contains("agbroadband") {
+                            schedule_install_cleanup(install_dir.to_path_buf());
                         }
                     }
                 }
+
                 std::process::exit(0);
             }
         }
     }
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Schedules deletion of the install directory after this process exits.
+///
+/// The running exe cannot delete itself (Windows locks open executables).
+/// This creates a hidden batch file in `%TEMP%` that polls until
+/// `agb-cloud-client.exe` is no longer running, then removes the entire
+/// install directory with `rmdir /s /q`.
+///
+/// Used only when the user cancels the setup wizard before completing
+/// installation (fresh-install cancel path).
+#[cfg(target_os = "windows")]
+fn schedule_install_cleanup(install_dir: std::path::PathBuf) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let dir = install_dir.to_string_lossy().into_owned();
+    let batch = format!(
+        "@echo off\r\n\
+        :poll\r\n\
+        tasklist /FI \"IMAGENAME eq agb-cloud-client.exe\" 2>nul \
+            | find /I \"agb-cloud-client.exe\" >nul\r\n\
+        if not errorlevel 1 (ping -n 2 127.0.0.1 >nul & goto poll)\r\n\
+        rmdir /s /q \"{dir}\"\r\n\
+        del \"%~f0\"\r\n",
+        dir = dir
+    );
+
+    let batch_path = std::env::temp_dir().join("agb_setup_cancel.bat");
+    if std::fs::write(&batch_path, &batch).is_ok() {
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", batch_path.to_str().unwrap_or("")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn schedule_install_cleanup(_install_dir: std::path::PathBuf) {}

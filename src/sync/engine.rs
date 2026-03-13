@@ -1,12 +1,14 @@
 use anyhow::Result;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthState;
 use crate::config::AppConfig;
 use crate::models::{CloudFile, FolderSelection, SyncPolicy};
-use crate::sync::progress::{SharedProgress, SyncPhase};
+use crate::sync::progress::{write_progress_file, SharedProgress, SyncPhase};
 use crate::sync::remote::RemoteClient;
 use crate::ui::common::NOTIFICATION_APP_ID;
 
@@ -23,7 +25,9 @@ impl SyncEngine {
     }
 
     /// Main sync loop — runs forever, reloading config from disk each cycle.
-    pub async fn run(&self) {
+    /// `sync_trigger` is a `Notify` that can interrupt the sleep between cycles
+    /// so a newly-saved folder selection syncs immediately (no full interval wait).
+    pub async fn run(&self, sync_trigger: Arc<Notify>) {
         info!("Sync engine started");
         loop {
             let config = match AppConfig::load_or_create() {
@@ -66,7 +70,13 @@ impl SyncEngine {
             }
 
             self.set_phase(SyncPhase::Idle);
-            sleep(Duration::from_secs(config.sync_interval_secs)).await;
+            // Interruptible sleep: wakes up early when Manage Folders saves new selections.
+            tokio::select! {
+                _ = sleep(Duration::from_secs(config.sync_interval_secs)) => {}
+                _ = sync_trigger.notified() => {
+                    info!("Sync triggered early — new folder selections detected");
+                }
+            }
         }
     }
 
@@ -108,6 +118,19 @@ impl SyncEngine {
 
     /// Sync only the user-selected folders/files.
     async fn selective_sync(&self, config: &AppConfig) -> Result<()> {
+        // Guard: skip entire cycle if the sync folder is inaccessible
+        // (network drive disconnected, USB removed, path deleted, etc.)
+        if tokio::fs::metadata(&config.sync_folder).await.is_err() {
+            warn!("Sync folder inaccessible: {} — skipping cycle", config.sync_folder);
+            self.update_progress(|p| {
+                p.last_error = Some(format!(
+                    "Sync folder not found: {}",
+                    config.sync_folder
+                ));
+            });
+            return Ok(());
+        }
+
         let selections = filter_root_selections(&config.selected_folders);
         info!("Syncing {} root selection(s)", selections.len());
 
@@ -171,17 +194,26 @@ impl SyncEngine {
             }
         }
 
-        // Mark completed Copy folders and persist to config
+        // Mark completed Copy folders and persist to config.
+        // IMPORTANT: reload a fresh copy from disk before saving so we don't overwrite
+        // any settings changes (sync_folder, selected_folders, etc.) that the user may
+        // have made via Settings or Manage Folders while this sync cycle was running.
         if !completed_uuids.is_empty() {
-            let mut updated_config = config.clone();
-            for folder in &mut updated_config.selected_folders {
-                if completed_uuids.contains(&folder.uuid) {
-                    folder.completed = true;
-                    info!("Marked copy as completed: {}", folder.name);
+            match crate::config::AppConfig::load_or_create() {
+                Ok(mut fresh_config) => {
+                    for folder in &mut fresh_config.selected_folders {
+                        if completed_uuids.contains(&folder.uuid) {
+                            folder.completed = true;
+                            info!("Marked copy as completed: {}", folder.name);
+                        }
+                    }
+                    if let Err(e) = fresh_config.save() {
+                        error!("Failed to save config after marking copies complete: {e}");
+                    }
                 }
-            }
-            if let Err(e) = updated_config.save() {
-                error!("Failed to save config after marking copies complete: {e}");
+                Err(e) => {
+                    error!("Failed to reload config for marking copies complete: {e}");
+                }
             }
         }
 
@@ -297,12 +329,15 @@ impl SyncEngine {
     fn set_phase(&self, phase: SyncPhase) {
         if let Ok(mut p) = self.progress.lock() {
             p.phase = phase;
+            write_progress_file(&p);
         }
     }
 
     fn update_progress(&self, f: impl FnOnce(&mut crate::sync::progress::SyncProgress)) {
         if let Ok(mut p) = self.progress.lock() {
             f(&mut p);
+            // Write to disk so the status panel subprocess can read live progress.
+            write_progress_file(&p);
         }
     }
 }

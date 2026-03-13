@@ -1,109 +1,110 @@
 pub mod menu;  // reserved for future menu extensions
 
 use std::sync::{Arc, Mutex};
-use tracing::{error, info};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, MenuId};
+use tracing::{error, info, warn};
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 
 use crate::auth::AuthState;
 use crate::config::AppConfig;
+use crate::sync::progress::{read_progress_file, write_progress_file};
 use crate::sync::SharedProgress;
 
 type Children = Arc<Mutex<Vec<std::process::Child>>>;
 
-// ── Menu item ID bundle ────────────────────────────────────────────────────────
-
+/// IDs of the context menu items (stored so we can match events).
 struct MenuIds {
-    // Authenticated items (Some only in auth menu)
-    open_id:     Option<MenuId>,
-    manage_id:   Option<MenuId>,
-    settings_id: Option<MenuId>,
-    logout_id:   Option<MenuId>,
-    // Unauthenticated items (Some only in unauth menu)
-    sign_in_id:  Option<MenuId>,
-    // Always present
-    quit_id:     MenuId,
-    is_auth:     bool,
+    status:  tray_icon::menu::MenuId,
+    folders: tray_icon::menu::MenuId,
+    settings: tray_icon::menu::MenuId,
+    logout:  tray_icon::menu::MenuId,
+    quit:    tray_icon::menu::MenuId,
 }
 
-fn build_tray_menu(is_auth: bool) -> (Menu, MenuIds) {
+/// Build the right-click context menu and return it with the item IDs.
+fn build_context_menu() -> (Menu, MenuIds) {
+    let status_item   = MenuItem::new("Open Status Panel",  true, None);
+    let folders_item  = MenuItem::new("Manage Folders...",  true, None);
+    let settings_item = MenuItem::new("Settings...",        true, None);
+    let logout_item   = MenuItem::new("Sign Out",           true, None);
+    let quit_item     = MenuItem::new("Quit",               true, None);
+
+    let ids = MenuIds {
+        status:   status_item.id().clone(),
+        folders:  folders_item.id().clone(),
+        settings: settings_item.id().clone(),
+        logout:   logout_item.id().clone(),
+        quit:     quit_item.id().clone(),
+    };
+
     let menu = Menu::new();
-    if is_auth {
-        let open     = MenuItem::new("Open Sync Folder", true, None);
-        let manage   = MenuItem::new("Manage Folders",   true, None);
-        let settings = MenuItem::new("Settings",         true, None);
-        let logout   = MenuItem::new("Logout",           true, None);
-        let quit     = MenuItem::new("Quit",             true, None);
-        let ids = MenuIds {
-            open_id:     Some(open.id().clone()),
-            manage_id:   Some(manage.id().clone()),
-            settings_id: Some(settings.id().clone()),
-            logout_id:   Some(logout.id().clone()),
-            sign_in_id:  None,
-            quit_id:     quit.id().clone(),
-            is_auth:     true,
-        };
-        menu.append(&open).ok();
-        menu.append(&manage).ok();
-        menu.append(&settings).ok();
-        menu.append(&logout).ok();
-        menu.append(&quit).ok();
-        (menu, ids)
-    } else {
-        let sign_in = MenuItem::new("Sign In...", true, None);
-        let quit    = MenuItem::new("Quit",       true, None);
-        let ids = MenuIds {
-            open_id:     None,
-            manage_id:   None,
-            settings_id: None,
-            logout_id:   None,
-            sign_in_id:  Some(sign_in.id().clone()),
-            quit_id:     quit.id().clone(),
-            is_auth:     false,
-        };
-        menu.append(&sign_in).ok();
-        menu.append(&quit).ok();
-        (menu, ids)
-    }
-}
+    menu.append_items(&[
+        &status_item,
+        &folders_item,
+        &settings_item,
+        &PredefinedMenuItem::separator(),
+        &logout_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+    ])
+    .expect("Failed to build tray context menu");
 
-// ── Action returned by the menu event handler ─────────────────────────────────
-
-enum MenuAction {
-    None,
-    /// Process must terminate — caller handles exit so it fires from the main loop.
-    Quit,
+    (menu, ids)
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Run the system tray icon with context menu.
-/// Blocks the calling thread (main thread) forever, pumping Windows messages.
+/// Run the system tray icon.
+/// Left-click  → open status panel (or login if unauthenticated).
+/// Right-click → show context menu.
+/// Blocks the calling thread (main thread) forever.
 pub fn run_tray(
     auth: &AuthState,
-    config: &AppConfig,
+    _config: &AppConfig,
     rt: &tokio::runtime::Runtime,
     progress: SharedProgress,
+    sync_trigger: std::sync::Arc<tokio::sync::Notify>,
 ) {
-    let icon = crate::ui::icon::tray_icon();
+    let mut is_auth = rt.block_on(auth.is_authenticated());
 
-    // Build initial menu based on current auth state
-    let is_auth = rt.block_on(auth.is_authenticated());
-    let (initial_menu, mut ids) = build_tray_menu(is_auth);
+    // Retry tray icon creation — the notification area may not be fully
+    // initialized if Explorer was just restarted.
+    let (menu, menu_ids, tray_icon) = {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let icon = crate::ui::icon::tray_icon();
+            let (m, ids) = build_context_menu();
 
-    let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(initial_menu))
-        .with_tooltip("AGB Cloud Client — AGBroadband")
-        .with_icon(icon)
-        .build()
-        .expect("Failed to create tray icon");
+            match TrayIconBuilder::new()
+                .with_tooltip("AGB Cloud Client — AGBroadband")
+                .with_icon(icon)
+                // No with_menu: left-click opens panel, right-click shows menu manually
+                .build()
+            {
+                Ok(t) => {
+                    if attempt > 1 {
+                        info!("Tray icon created on attempt {attempt}");
+                    }
+                    break (m, ids, t);
+                }
+                Err(e) if attempt < 5 => {
+                    warn!("Tray icon creation failed (attempt {attempt}/5): {e} — retrying in 1s");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+                Err(e) => {
+                    error!("Failed to create tray icon after 5 attempts: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
 
-    info!("System tray running (authenticated: {is_auth})");
+    info!("System tray running (context menu enabled, authenticated: {is_auth})");
 
-    let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayIconEvent::receiver();
+    let menu_channel = MenuEvent::receiver();
     let auth_clone = auth.clone();
-    let config_ptr = config as *const AppConfig;
 
     // Track spawned subprocesses so we can kill them on Quit
     let children: Children = Arc::new(Mutex::new(Vec::new()));
@@ -111,7 +112,8 @@ pub fn run_tray(
     let mut last_tooltip = String::new();
     let mut tick_count: u32 = 0;
     let mut auth_check_ticks: u32 = 0;
-    let mut last_menu_event = std::time::Instant::now()
+    // Debounce tray clicks
+    let mut last_click = std::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(10))
         .unwrap_or_else(std::time::Instant::now);
 
@@ -130,39 +132,86 @@ pub fn run_tray(
                 }
             }
 
-            // Handle menu item clicks
+            // Tray clicks: left → panel, right → context menu
+            if let Ok(ev) = tray_channel.try_recv() {
+                match ev {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        if last_click.elapsed() > std::time::Duration::from_millis(500) {
+                            last_click = std::time::Instant::now();
+                            if is_auth {
+                                info!("Tray left-click — opening status panel");
+                                spawn_ui_subprocess("--status", &children);
+                            } else {
+                                info!("Tray left-click (unauthenticated) — opening login");
+                                spawn_login();
+                            }
+                        }
+                    }
+                    TrayIconEvent::Click {
+                        button: MouseButton::Right,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        info!("Tray right-click — showing context menu");
+                        unsafe {
+                            use winapi::um::winuser::{
+                                GetCursorPos, GetDesktopWindow, SetForegroundWindow,
+                                TrackPopupMenu, PostMessageW, WM_NULL, TPM_LEFTALIGN, TPM_BOTTOMALIGN,
+                            };
+                            use tray_icon::menu::ContextMenu as _;
+                            let mut pt = winapi::shared::windef::POINT { x: 0, y: 0 };
+                            GetCursorPos(&mut pt);
+                            let hwnd = GetDesktopWindow();
+                            SetForegroundWindow(hwnd);
+                            TrackPopupMenu(
+                                menu.hpopupmenu() as winapi::shared::windef::HMENU,
+                                TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+                                pt.x, pt.y, 0, hwnd, std::ptr::null(),
+                            );
+                            PostMessageW(hwnd, WM_NULL, 0, 0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Context menu item selected (right-click menu)
             if let Ok(event) = menu_channel.try_recv() {
-                last_menu_event = std::time::Instant::now();
-                let config_ref = unsafe { &*config_ptr };
-                match handle_menu_event(&event.id, &ids, &auth_clone, config_ref, rt, &children) {
-                    MenuAction::Quit => {
-                        info!("Quit — killing subprocesses and terminating");
+                if event.id == menu_ids.status {
+                    info!("Menu: Open Status Panel");
+                    if is_auth {
+                        spawn_ui_subprocess("--status", &children);
+                    } else {
+                        spawn_login();
+                    }
+                } else if event.id == menu_ids.folders {
+                    info!("Menu: Manage Folders");
+                    spawn_ui_subprocess("--manage-folders", &children);
+                } else if event.id == menu_ids.settings {
+                    info!("Menu: Settings");
+                    spawn_ui_subprocess("--settings", &children);
+                } else if event.id == menu_ids.logout {
+                    if is_auth {
+                        info!("Menu: Sign Out");
+                        let _ = rt.block_on(auth_clone.logout());
+                        if let Ok(exe) = std::env::current_exe() {
+                            if let Err(e) = std::process::Command::new(&exe).arg("--login").spawn() {
+                                error!("Failed to relaunch for sign-in: {e}");
+                            }
+                        }
                         kill_all_children(&children);
                         drop(tray_icon);
                         std::process::exit(0);
                     }
-                    MenuAction::None => {}
-                }
-            }
-
-            // Left-click on tray icon
-            if let Ok(TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            }) = tray_channel.try_recv()
-            {
-                if last_menu_event.elapsed() > std::time::Duration::from_millis(500) {
-                    let config_ref = unsafe { &*config_ptr };
-                    if ids.is_auth {
-                        info!("Tray icon clicked — opening sync folder");
-                        if let Err(e) = open::that(&config_ref.sync_folder) {
-                            error!("Failed to open folder: {e}");
-                        }
-                    } else {
-                        info!("Tray icon clicked (unauthenticated) — opening login");
-                        spawn_login();
-                    }
+                } else if event.id == menu_ids.quit {
+                    info!("Menu: Quit");
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
                 }
             }
 
@@ -188,11 +237,38 @@ pub fn run_tray(
             if auth_check_ticks >= 3000 {
                 auth_check_ticks = 0;
                 let new_auth = rt.block_on(auth_clone.is_authenticated());
-                if new_auth != ids.is_auth {
-                    info!("Auth state changed ({} → {}) — rebuilding tray menu", ids.is_auth, new_auth);
-                    let (new_menu, new_ids) = build_tray_menu(new_auth);
-                    tray_icon.set_menu(Some(Box::new(new_menu)));
-                    ids = new_ids;
+                if new_auth != is_auth {
+                    info!("Auth state changed ({} → {})", is_auth, new_auth);
+                    is_auth = new_auth;
+                }
+            }
+
+            // Poll quit/logout/sync signals from status panel every ~5 s (500 ticks × 10 ms)
+            if tick_count % 500 == 0 {
+                let mut sig = read_progress_file();
+                if sig.quit_requested {
+                    info!("Quit signal received from status panel — terminating");
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
+                }
+                if sig.logout_requested {
+                    info!("Logout signal received from status panel");
+                    let _ = rt.block_on(auth_clone.logout());
+                    if let Ok(exe) = std::env::current_exe() {
+                        if let Err(e) = std::process::Command::new(&exe).arg("--login").spawn() {
+                            error!("Failed to relaunch for sign-in: {e}");
+                        }
+                    }
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
+                }
+                if sig.sync_requested {
+                    info!("Sync trigger received — waking engine immediately");
+                    sig.sync_requested = false;
+                    write_progress_file(&sig);
+                    sync_trigger.notify_one();
                 }
             }
 
@@ -203,33 +279,56 @@ pub fn run_tray(
     #[cfg(not(target_os = "windows"))]
     {
         loop {
-            if let Ok(event) = menu_channel.try_recv() {
-                last_menu_event = std::time::Instant::now();
-                let config_ref = unsafe { &*config_ptr };
-                match handle_menu_event(&event.id, &ids, &auth_clone, config_ref, rt, &children) {
-                    MenuAction::Quit => {
-                        info!("Quit — killing subprocesses and terminating");
-                        kill_all_children(&children);
-                        drop(tray_icon);
-                        std::process::exit(0);
+            // Tray clicks: left → panel, right → context menu
+            if let Ok(ev) = tray_channel.try_recv() {
+                match ev {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        if last_click.elapsed() > std::time::Duration::from_millis(500) {
+                            last_click = std::time::Instant::now();
+                            if is_auth {
+                                spawn_ui_subprocess("--status", &children);
+                            } else {
+                                spawn_login();
+                            }
+                        }
                     }
-                    MenuAction::None => {}
+                    TrayIconEvent::Click {
+                        button: MouseButton::Right,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } => {
+                        let hwnd = unsafe { winapi::um::winuser::GetDesktopWindow() as isize };
+                        use tray_icon::menu::ContextMenu as _;
+                        menu.show_context_menu_for_hwnd(hwnd, None);
+                    }
+                    _ => {}
                 }
             }
 
-            if let Ok(TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                ..
-            }) = tray_channel.try_recv()
-            {
-                if last_menu_event.elapsed() > std::time::Duration::from_millis(500) {
-                    let config_ref = unsafe { &*config_ptr };
-                    if ids.is_auth {
-                        let _ = open::that(&config_ref.sync_folder);
-                    } else {
-                        spawn_login();
+            // Context menu
+            if let Ok(event) = menu_channel.try_recv() {
+                if event.id == menu_ids.status {
+                    if is_auth { spawn_ui_subprocess("--status", &children); } else { spawn_login(); }
+                } else if event.id == menu_ids.folders {
+                    spawn_ui_subprocess("--manage-folders", &children);
+                } else if event.id == menu_ids.settings {
+                    spawn_ui_subprocess("--settings", &children);
+                } else if event.id == menu_ids.logout && is_auth {
+                    let _ = rt.block_on(auth_clone.logout());
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(&exe).arg("--login").spawn();
                     }
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
+                } else if event.id == menu_ids.quit {
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
                 }
             }
 
@@ -249,83 +348,38 @@ pub fn run_tray(
             if auth_check_ticks >= 600 {
                 auth_check_ticks = 0;
                 let new_auth = rt.block_on(auth_clone.is_authenticated());
-                if new_auth != ids.is_auth {
-                    info!("Auth state changed ({} → {}) — rebuilding tray menu", ids.is_auth, new_auth);
-                    let (new_menu, new_ids) = build_tray_menu(new_auth);
-                    tray_icon.set_menu(Some(Box::new(new_menu)));
-                    ids = new_ids;
+                if new_auth != is_auth {
+                    info!("Auth state changed ({} → {})", is_auth, new_auth);
+                    is_auth = new_auth;
+                }
+            }
+
+            if tick_count % 100 == 0 {
+                let mut sig = read_progress_file();
+                if sig.quit_requested {
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
+                }
+                if sig.logout_requested {
+                    let _ = rt.block_on(auth_clone.logout());
+                    if let Ok(exe) = std::env::current_exe() {
+                        let _ = std::process::Command::new(&exe).arg("--login").spawn();
+                    }
+                    kill_all_children(&children);
+                    drop(tray_icon);
+                    std::process::exit(0);
+                }
+                if sig.sync_requested {
+                    sig.sync_requested = false;
+                    write_progress_file(&sig);
+                    sync_trigger.notify_one();
                 }
             }
 
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-}
-
-// ── Event handler ─────────────────────────────────────────────────────────────
-
-fn handle_menu_event(
-    id: &MenuId,
-    ids: &MenuIds,
-    auth: &AuthState,
-    config: &AppConfig,
-    rt: &tokio::runtime::Runtime,
-    children: &Children,
-) -> MenuAction {
-    // Authenticated menu items
-    if let Some(ref oid) = ids.open_id {
-        if id == oid {
-            info!("Opening sync folder: {}", config.sync_folder);
-            if let Err(e) = open::that(&config.sync_folder) {
-                error!("Failed to open folder: {e}");
-            }
-            return MenuAction::None;
-        }
-    }
-    if let Some(ref mid) = ids.manage_id {
-        if id == mid {
-            info!("Manage folders clicked — launching subprocess");
-            spawn_ui_subprocess("--manage-folders", children);
-            return MenuAction::None;
-        }
-    }
-    if let Some(ref sid) = ids.settings_id {
-        if id == sid {
-            info!("Settings clicked — launching subprocess");
-            spawn_ui_subprocess("--settings", children);
-            return MenuAction::None;
-        }
-    }
-    if let Some(ref lid) = ids.logout_id {
-        if id == lid {
-            info!("Logging out...");
-            let _ = rt.block_on(auth.logout());
-            info!("Logged out — relaunching for sign-in.");
-            if let Ok(exe) = std::env::current_exe() {
-                if let Err(e) = std::process::Command::new(&exe).arg("--login").spawn() {
-                    error!("Failed to relaunch for sign-in: {e}");
-                }
-            }
-            return MenuAction::Quit;
-        }
-    }
-
-    // Unauthenticated menu items
-    if let Some(ref siid) = ids.sign_in_id {
-        if id == siid {
-            info!("Sign In clicked — launching login window");
-            spawn_login();
-            return MenuAction::None;
-        }
-    }
-
-    // Quit (always present)
-    if id == &ids.quit_id {
-        info!("Quit menu item matched");
-        return MenuAction::Quit;
-    }
-
-    MenuAction::None
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -355,7 +409,7 @@ fn spawn_ui_subprocess(flag: &str, children: &Children) {
     }
 }
 
-/// Kill all tracked subprocesses (Settings, Manage Folders windows).
+/// Kill all tracked subprocesses (Settings, Manage Folders, Status windows).
 /// Called on Quit so all open windows are closed with the tray.
 fn kill_all_children(children: &Children) {
     if let Ok(mut c) = children.lock() {

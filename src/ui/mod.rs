@@ -5,6 +5,7 @@ pub mod icon;
 pub mod login;
 pub mod login_widget;
 pub mod settings;
+pub mod status_panel;
 pub mod wizard;
 
 pub use file_browser::show_file_browser;
@@ -13,4 +14,5 @@ pub use login::show_login_window;
 #[allow(unused_imports)]
 pub use login_widget::{LoginOutcome, LoginWidget};
 pub use settings::show_settings_window;
+pub use status_panel::show_status_panel;
 pub use wizard::show_setup_wizard;

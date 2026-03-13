@@ -244,6 +244,8 @@ impl AuthState {
             .send()
             .await?;
 
+        // Save status before the response body is consumed.
+        let status = resp.status();
         let (jwt, refresh) = Self::extract_cookies(&resp);
 
         let text = resp.text().await?;
@@ -256,7 +258,15 @@ impl AuthState {
             return Ok(());
         }
 
-        // 2FA required — server sent verification code to user's email
+        // HTTP error (wrong credentials, account locked, etc.) — surface the
+        // backend message directly so the UI can display it.
+        if !status.is_success() {
+            let msg = response.message
+                .unwrap_or_else(|| format!("Login failed ({})", status.as_u16()));
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+
+        // HTTP 2xx with no JWT → server sent a verification code to the user's email.
         if response.message.is_some() {
             return Err(anyhow::anyhow!("2FA_REQUIRED"));
         }
