@@ -47,7 +47,7 @@ impl SettingsApp {
         let dummy_trigger = Arc::new(tokio::sync::Notify::new());
         handle.spawn(async move {
             let my_username = ws_auth.current_username().await.unwrap_or_default();
-            WsClient::run(ws_config, ws_auth, dummy_trigger, Some((my_username, patch_tx))).await;
+            WsClient::run(ws_config, ws_auth, dummy_trigger, Some((my_username, patch_tx)), None).await;
         });
 
         let mut tree = FolderTreeWidget::new(auth.clone(), handle)

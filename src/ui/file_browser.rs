@@ -49,6 +49,7 @@ impl FileBrowserApp {
                 ws_auth,
                 dummy_trigger,
                 Some((my_username, patch_tx)),
+                None, // update events handled by tray process only
             ).await;
         });
 

@@ -95,7 +95,7 @@ pub fn show_status_panel(auth: &AuthState, rt: &tokio::runtime::Runtime) {
     let dummy_trigger = Arc::new(tokio::sync::Notify::new());
     rt.spawn(async move {
         let my_username = ws_auth.current_username().await.unwrap_or_default();
-        WsClient::run(ws_config, ws_auth, dummy_trigger, Some((my_username, patch_tx))).await;
+        WsClient::run(ws_config, ws_auth, dummy_trigger, Some((my_username, patch_tx)), None).await;
     });
 
     info!("Launching status panel at ({pos_x:.0}, {pos_y:.0}), size {win_w}x{win_h:.0}");

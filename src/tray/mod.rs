@@ -617,6 +617,125 @@ fn spawn_ui_subprocess(flag: &str, children: &Children) {
     }
 }
 
+/// Minimal tray loop used when an update is required.
+///
+/// Shows a single-item context menu ("Install Update") and blocks all other
+/// actions until the update window subprocess completes installation.
+/// The sync engine is intentionally NOT started in this path.
+pub fn run_tray_update_mode(
+    _auth: &crate::auth::AuthState,
+    _config: &crate::config::AppConfig,
+    _rt: &tokio::runtime::Runtime,
+    info: &crate::update::UpdateInfo,
+) {
+    use tray_icon::menu::ContextMenu as _;
+
+    let update_item = tray_icon::menu::MenuItem::new(
+        &format!("⬆  Install Update {}…", info.version),
+        true,
+        None,
+    );
+    let quit_item = tray_icon::menu::MenuItem::new("Quit", true, None);
+
+    let update_id = update_item.id().clone();
+    let quit_id   = quit_item.id().clone();
+
+    let menu = Menu::new();
+    menu.append_items(&[&update_item, &PredefinedMenuItem::separator(), &quit_item])
+        .expect("update menu build failed");
+
+    let icon = crate::ui::icon::tray_icon();
+    let tray_icon = TrayIconBuilder::new()
+        .with_tooltip("AGB Cloud Client — Update Required")
+        .with_icon(icon)
+        .build()
+        .expect("tray icon (update mode)");
+
+    let tray_channel = TrayIconEvent::receiver();
+    let menu_channel = MenuEvent::receiver();
+    let info_clone   = info.clone();
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::mem::zeroed;
+        use winapi::um::winuser::{DispatchMessageW, PeekMessageW, TranslateMessage, PM_REMOVE, MSG};
+
+        loop {
+            unsafe {
+                let mut msg: MSG = zeroed();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+
+            if let Ok(ev) = tray_channel.try_recv() {
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = ev
+                {
+                    // Left-click → open update window
+                    crate::main_spawn_update_subprocess(&info_clone);
+                }
+                if let TrayIconEvent::Click {
+                    button: MouseButton::Right,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } = ev
+                {
+                    unsafe {
+                        use winapi::um::winuser::{
+                            CreateWindowExW, DestroyWindow, GetCursorPos, SetForegroundWindow,
+                            WS_EX_TOOLWINDOW, WS_POPUP,
+                        };
+                        let mut pt = winapi::shared::windef::POINT { x: 0, y: 0 };
+                        GetCursorPos(&mut pt);
+                        let cls: Vec<u16> = "STATIC\0".encode_utf16().collect();
+                        let hwnd = CreateWindowExW(
+                            WS_EX_TOOLWINDOW, cls.as_ptr(), std::ptr::null(),
+                            WS_POPUP, pt.x, pt.y, 1, 1,
+                            std::ptr::null_mut(), std::ptr::null_mut(),
+                            std::ptr::null_mut(), std::ptr::null_mut(),
+                        );
+                        if !hwnd.is_null() {
+                            SetForegroundWindow(hwnd);
+                            menu.show_context_menu_for_hwnd(hwnd as isize, None);
+                            DestroyWindow(hwnd);
+                        }
+                    }
+                }
+            }
+
+            if let Ok(event) = menu_channel.try_recv() {
+                if event.id == update_id {
+                    crate::main_spawn_update_subprocess(&info_clone);
+                } else if event.id == quit_id {
+                    drop(tray_icon);
+                    std::process::exit(0);
+                }
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        loop {
+            if let Ok(event) = menu_channel.try_recv() {
+                if event.id == update_id {
+                    crate::main_spawn_update_subprocess(&info_clone);
+                } else if event.id == quit_id {
+                    std::process::exit(0);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 /// Kill all tracked subprocesses (Settings, Manage Folders, Status windows).
 /// Called on Quit so all open windows are closed with the tray.
 /// Also writes the shutdown flag so any subprocess from a previous session exits too.

@@ -34,6 +34,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rfd = "0.15"
 winapi = { version = "0.3", features = ["winuser", "shellapi", "fileapi", "minwindef", "winbase", "tlhelp32"] }
 notify-rust = "4"
+semver = "1"
 
 [dev-dependencies]
 bytes = "1"

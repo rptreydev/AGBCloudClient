@@ -8,6 +8,7 @@ mod models;
 mod sync;
 mod tray;
 mod ui;
+mod update;
 mod ws;
 
 use std::env;
@@ -15,6 +16,7 @@ use std::sync::mpsc;
 use std::sync::atomic::Ordering;
 use single_instance::SingleInstance;
 use tracing::{error, info, warn};
+use update::{check_for_update, read_update_flag, write_update_flag};
 use ws::events::TreePatchAction;
 use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -75,6 +77,10 @@ fn main() {
     let login_mode = args.contains(&"--login".to_string());
     // Called by the NSIS uninstaller before removing files — cleans up shortcuts.
     let uninstall_mode = args.contains(&"--uninstall".to_string());
+    // Spawned by the tray when an update is available. Shows a mandatory update
+    // window with a download progress bar. The window cannot be closed without
+    // installing the update. Args: --update --version <ver> --url <download_url>
+    let update_mode = args.contains(&"--update".to_string());
     // Spawned by the setup wizard on completion.  Skips SingleInstance because the
     // wizard process (which holds the mutex) sleeps 800ms then exits — without this
     // flag the fresh tray would detect "another instance running" and exit immediately,
@@ -93,7 +99,7 @@ fn main() {
     //                  then acquire the mutex.
     // Subprocesses   → no lock needed (short-lived UI helpers).
     let _instance = if !force_setup && !manage_folders_mode && !settings_mode
-        && !status_mode && !login_mode && !uninstall_mode && !from_wizard
+        && !status_mode && !login_mode && !uninstall_mode && !from_wizard && !update_mode
     {
         let inst = SingleInstance::new("agb-cloud-client-agbroadband")
             .expect("Failed to create instance lock");
@@ -279,6 +285,37 @@ fn main() {
         return;
     }
 
+    // Handle --update (spawned by tray when a new version is available).
+    // Shows a mandatory update window — the user cannot proceed without installing.
+    // Args: --update --version <ver> --url <download_url>
+    if update_mode {
+        let version = args.iter()
+            .position(|a| a == "--version")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default();
+        let url = args.iter()
+            .position(|a| a == "--url")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .unwrap_or_default();
+
+        if version.is_empty() || url.is_empty() {
+            // Fallback: read from flag file (written by previous WS event).
+            if let Some(info) = read_update_flag() {
+                info!("Update mode — showing window for v{}", info.version);
+                ui::show_update_window(info, &rt);
+            } else {
+                warn!("--update: no version/url provided and no flag file found");
+            }
+        } else {
+            let info = update::UpdateInfo { version, download_url: url };
+            info!("Update mode — showing window for v{}", info.version);
+            ui::show_update_window(info, &rt);
+        }
+        std::process::exit(0);
+    }
+
     // Handle --login (spawned by tray after logout)
     // Shows the login window; on success spawns a fresh tray process INSIDE
     // eframe before GPU teardown, then exits via exit(0).
@@ -423,6 +460,31 @@ fn main() {
         ))
     };
 
+    // ── Startup update check ──────────────────────────────────────────────────
+    // 1. If a previous WS event left a flag file, an update is still pending.
+    // 2. Otherwise, poll the version endpoint if one is configured.
+    // If an update is found → spawn the mandatory update window + block the
+    // tray in update-mode (sync disabled, menu limited).
+    // To wire the endpoint: set `config.update_check_url` to the backend URL.
+    {
+        let pending = read_update_flag().or_else(|| {
+            if config.update_check_url.is_empty() {
+                None
+            } else {
+                let http = auth_state.client();
+                rt.block_on(check_for_update(&config.update_check_url, &http))
+            }
+        });
+        if let Some(info) = pending {
+            write_update_flag(&info);
+            info!("Update required on startup: v{}", info.version);
+            spawn_update_subprocess(&info);
+            // Run tray in update mode (limited menu, no sync engine started).
+            tray::run_tray_update_mode(&auth_state, &config, &rt, &info);
+            std::process::exit(0);
+        }
+    }
+
     info!(
         "Starting sync with {} selected folder(s)",
         config.selected_folders.len()
@@ -444,16 +506,36 @@ fn main() {
     };
 
     // Spawn WebSocket listener — wakes the sync engine on CLOUD_FILE events.
-    // Also listens for company_supervisor.changed so the tray can abort sync
-    // immediately if a company is removed while a cycle is running.
+    // Also listens for company_supervisor.changed (tree patches) and
+    // app.update_available (new installer published by the backend).
     let (patch_tx, patch_rx) = mpsc::channel::<ws::events::TreePatch>();
+    let (update_ws_tx, update_ws_rx) = mpsc::channel::<update::UpdateInfo>();
     {
-        let ws_config = config.clone();
-        let ws_auth   = auth_state.clone();
+        let ws_config  = config.clone();
+        let ws_auth    = auth_state.clone();
         let ws_trigger = sync_trigger.clone();
         rt.spawn(async move {
             let my_username = ws_auth.current_username().await.unwrap_or_default();
-            ws::WsClient::run(ws_config, ws_auth, ws_trigger, Some((my_username, patch_tx))).await;
+            ws::WsClient::run(
+                ws_config, ws_auth, ws_trigger,
+                Some((my_username, patch_tx)),
+                Some(update_ws_tx),
+            ).await;
+        });
+    }
+
+    // Bridge: handle app.update_available events from the WS listener.
+    // When the backend publishes a new installer, this thread receives the info,
+    // persists a flag file, and spawns the mandatory update window subprocess.
+    {
+        std::thread::spawn(move || {
+            while let Ok(info) = update_ws_rx.recv() {
+                info!("WS update event received: v{}", info.version);
+                if update::is_newer_version(&info.version) {
+                    write_update_flag(&info);
+                    spawn_update_subprocess(&info);
+                }
+            }
         });
     }
 
@@ -498,6 +580,40 @@ fn main() {
     info!("Starting system tray...");
     tray::run_tray(&auth_state, &config, &rt, progress, sync_trigger);
     info!("Tray exited — shutting down");
+}
+
+/// Spawn the update window as a subprocess (`--update --version <v> --url <u>`).
+/// Public so `tray::run_tray_update_mode` can call it on left-click / menu.
+pub fn main_spawn_update_subprocess(info: &update::UpdateInfo) {
+    spawn_update_subprocess(info);
+}
+
+/// Internal impl — see `main_spawn_update_subprocess` for the public alias.
+/// Called when a new version is detected on startup or via WS event.
+fn spawn_update_subprocess(info: &update::UpdateInfo) {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            #[cfg(target_os = "windows")]
+            let cmd = {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                std::process::Command::new(&exe)
+                    .args(["--update", "--version", &info.version, "--url", &info.download_url])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .spawn()
+            };
+            #[cfg(not(target_os = "windows"))]
+            let cmd = std::process::Command::new(&exe)
+                .args(["--update", "--version", &info.version, "--url", &info.download_url])
+                .spawn();
+
+            match cmd {
+                Ok(c) => info!("Update window spawned (pid={})", c.id()),
+                Err(e) => error!("Failed to spawn update window: {e}"),
+            }
+        }
+        Err(e) => error!("Cannot determine exe path for update spawn: {e}"),
+    }
 }
 
 /// Remove all selected folder entries that belong to a company from the persisted config.

@@ -41,6 +41,12 @@ pub struct AppConfig {
     /// Folders selected by the user for sync/copy
     #[serde(default)]
     pub selected_folders: Vec<FolderSelection>,
+
+    /// URL of the version check endpoint.
+    /// Format: GET <url> → { "version": "x.y.z", "downloadUrl": "https://..." }
+    /// Leave empty to disable automatic update checks (configure when backend is ready).
+    #[serde(default)]
+    pub update_check_url: String,
 }
 
 impl Default for AppConfig {
@@ -57,6 +63,8 @@ impl Default for AppConfig {
             max_concurrent_downloads: 3,
             setup_complete: false,
             selected_folders: vec![],
+            // Empty = update checks disabled until the endpoint is configured.
+            update_check_url: String::new(),
         }
     }
 }
