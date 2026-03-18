@@ -1012,7 +1012,15 @@ pub const NOTIFICATION_APP_ID: &str = "AGBroadband.CloudClient";
 
 /// Show a Windows toast when a file is actually downloaded by the sync engine.
 /// Called only for files in selected folders — no false positives.
-pub fn show_download_notification(name: &str, mime: Option<&str>) {
+/// `company`, `project`, `location` are the path components derived from the
+/// local destination path relative to the sync folder.
+pub fn show_download_notification(
+    name: &str,
+    mime: Option<&str>,
+    company: Option<&str>,
+    project: Option<&str>,
+    location: Option<&str>,
+) {
     let (icon, label) = match mime {
         Some(m) if m.starts_with("image/") => ("📷", "New photo synced"),
         Some(m) if m.starts_with("video/") => ("🎬", "New video synced"),
@@ -1023,14 +1031,83 @@ pub fn show_download_notification(name: &str, mime: Option<&str>) {
         Some(m) if m.starts_with("text/") => ("📄", "New file synced"),
         _                                  => ("📎", "New file synced"),
     };
+    // Build body:  Company › Project › Location (line 1)  +  filename (line 2)
+    let location_line = {
+        let parts: Vec<String> = [
+            company.map( |c| format!("🏢 {c}")),
+            project.map( |p| format!("📁 {p}")),
+            location.map(|l| format!("📍 {l}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        parts.join(" › ")
+    };
+    let body = if location_line.is_empty() {
+        name.to_string()
+    } else {
+        format!("{location_line}\n{name}")
+    };
     if let Err(e) = notify_rust::Notification::new()
         .app_id(NOTIFICATION_APP_ID)
         .summary(&format!("{icon} {label}"))
-        .body(name)
+        .body(&body)
         .timeout(notify_rust::Timeout::Milliseconds(5000))
         .show()
     {
         tracing::debug!("Download notification failed: {e}");
+    }
+}
+
+// ── Shutdown flag (IPC) ───────────────────────────────────────────────────────
+
+/// Path of the shutdown sentinel file written on Quit.
+pub fn shutdown_flag_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("agb_shutdown.flag")
+}
+
+/// Write the shutdown flag so all subprocesses (settings, folder manager, status)
+/// exit even if they were not tracked in the tray's `children` list (e.g. opened
+/// during a previous tray session that was restarted).
+pub fn request_shutdown() {
+    let _ = std::fs::write(shutdown_flag_path(), "");
+}
+
+/// Returns `true` if the tray has requested a global shutdown.
+/// All subprocess `update()` loops should check this and call `process::exit(0)`.
+pub fn is_shutdown_requested() -> bool {
+    shutdown_flag_path().exists()
+}
+
+/// Delete the shutdown flag — called at startup so stale flags from a previous
+/// crash don't immediately kill subprocesses on the next launch.
+pub fn clear_shutdown_flag() {
+    let _ = std::fs::remove_file(shutdown_flag_path());
+}
+
+/// Show a Windows toast when a new company is assigned to the user.
+pub fn show_company_assigned_notification(company_name: &str) {
+    if let Err(e) = notify_rust::Notification::new()
+        .app_id(NOTIFICATION_APP_ID)
+        .summary("🏢 New company assigned")
+        .body(&format!("You now have access to: {company_name}"))
+        .timeout(notify_rust::Timeout::Milliseconds(6000))
+        .show()
+    {
+        tracing::debug!("Company assigned notification failed: {e}");
+    }
+}
+
+/// Show a Windows toast when a company is removed from the user.
+pub fn show_company_removed_notification(company_name: &str) {
+    if let Err(e) = notify_rust::Notification::new()
+        .app_id(NOTIFICATION_APP_ID)
+        .summary("🏢 Company access removed")
+        .body(&format!("You no longer have access to: {company_name}"))
+        .timeout(notify_rust::Timeout::Milliseconds(6000))
+        .show()
+    {
+        tracing::debug!("Company removed notification failed: {e}");
     }
 }
 

@@ -51,6 +51,57 @@ impl RemoteClient {
         })
     }
 
+    /// Fetch root folders using role-aware routing.
+    ///
+    /// - **`COMPANY_SUPERVISOR` / `SUPERVISOR`** → `GET /cloud-file/folders`
+    ///   The backend filters results to only the companies/projects the user supervises.
+    ///
+    /// - **All other roles** → `GET /cloud-file`
+    ///   Returns all root folders (standard behaviour for ADMIN / TECH / etc.).
+    pub async fn get_roots_filtered(&self, is_supervisor: bool) -> Result<Vec<CloudFile>> {
+        if !is_supervisor {
+            return self.get_roots().await;
+        }
+
+        // For supervisors the backend returns a recursive TreeFolder[] — we only
+        // need the top-level items (children are loaded lazily via get_children).
+        let url = format!("{}/cloud-file/folders", self.auth.server_url());
+        info!("get_roots_filtered: using /cloud-file/folders (supervisor role)");
+        debug!("GET {url}");
+
+        let mut builder = self.auth.client().get(&url);
+        if let Some(token) = self.auth.get_token().await {
+            builder = builder.header("Cookie", format!("jwt={token}"));
+        }
+        let resp = builder.send().await?;
+
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if !status.is_success() {
+            error!("get_roots_filtered failed ({status}): {text}");
+            anyhow::bail!("get_roots_filtered failed with status {status}");
+        }
+
+        let mut roots: Vec<CloudFile> = serde_json::from_str(&text).map_err(|e| {
+            error!("get_roots_filtered parse error: {e}");
+            error!("Response body: {}", &text[..text.len().min(500)]);
+            anyhow::anyhow!("Failed to parse filtered roots response: {e}")
+        })?;
+
+        // Strip nested children — the tree widget loads them lazily via get_children().
+        // Keeping them would skip the lazy-load path and show stale/incomplete subtrees.
+        for root in &mut roots {
+            root.children = None;
+        }
+
+        info!(
+            "get_roots_filtered: {} supervised root folder(s)",
+            roots.len()
+        );
+        Ok(roots)
+    }
+
     /// Fetch direct children of a folder by UUID.
     ///
     /// Uses `GET /cloud-file/:uuid` which calls `findDescendantsTree(node, { depth:1 })`.

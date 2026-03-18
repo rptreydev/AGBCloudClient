@@ -91,11 +91,33 @@ impl CredentialStore {
         debug!("Auto-login password cleared for: {username}");
     }
 
+    /// Store the user's role string (e.g. "COMPANY_SUPERVISOR") for session restore.
+    pub fn store_user_role(username: &str, role: &str) -> Result<()> {
+        let key = format!("{username}_role");
+        let entry = Entry::new(SERVICE, &key)?;
+        entry.set_password(role)?;
+        debug!("User role stored for: {username}");
+        Ok(())
+    }
+
+    /// Get the stored user role string.
+    pub fn get_user_role(username: &str) -> Result<Option<String>> {
+        let key = format!("{username}_role");
+        let entry = Entry::new(SERVICE, &key)?;
+        match entry.get_password() {
+            Ok(role) => Ok(Some(role)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Keyring error: {e}")),
+        }
+    }
+
     /// Clear credentials for a specific user
     pub fn clear_user(username: &str) -> Result<()> {
         let _ = Entry::new(SERVICE, username).and_then(|e| e.delete_credential());
         let key = format!("{username}_refresh");
         let _ = Entry::new(SERVICE, &key).and_then(|e| e.delete_credential());
+        let role_key = format!("{username}_role");
+        let _ = Entry::new(SERVICE, &role_key).and_then(|e| e.delete_credential());
         Self::clear_password(username);
         warn!("Credentials cleared for user: {username}");
         Ok(())

@@ -3,6 +3,7 @@
 //! Communicates with the sync engine via a shared progress.json file.
 
 use std::sync::Arc;
+use std::sync::mpsc;
 use tracing::{error, info};
 
 use crate::auth::AuthState;
@@ -14,6 +15,7 @@ use crate::ui::common::{
     ERROR_COLOR, FOLDER_COLOR, SUCCESS_COLOR, SURFACE, SURFACE_VARIANT,
     TEXT_DISABLED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
+use crate::ws::events::{TreePatch, WsClient};
 
 /// A single filesystem entry (file or directory) for the inline file browser.
 struct DirEntry {
@@ -86,13 +88,23 @@ pub fn show_status_panel(auth: &AuthState, rt: &tokio::runtime::Runtime) {
         ..Default::default()
     };
 
+    // Spawn a WS listener so company-assignment changes refresh the panel in real-time.
+    let (patch_tx, patch_rx) = mpsc::channel();
+    let ws_auth   = auth.clone();
+    let ws_config = crate::config::AppConfig::load_or_create().unwrap_or_default();
+    let dummy_trigger = Arc::new(tokio::sync::Notify::new());
+    rt.spawn(async move {
+        let my_username = ws_auth.current_username().await.unwrap_or_default();
+        WsClient::run(ws_config, ws_auth, dummy_trigger, Some((my_username, patch_tx))).await;
+    });
+
     info!("Launching status panel at ({pos_x:.0}, {pos_y:.0}), size {win_w}x{win_h:.0}");
     let run_result = eframe::run_native(
         "AGB Cloud Client — Status",
         options,
         Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(StatusPanel::new(display_name, username, role_label)))
+            Ok(Box::new(StatusPanel::new(display_name, username, role_label, patch_rx)))
         }),
     );
     match run_result {
@@ -138,11 +150,13 @@ struct StatusPanel {
     search_query: String,
     /// Previous sync phase — used to detect Syncing → Idle transitions
     prev_phase: SyncPhase,
+    /// Receives company-assignment patches from the WS listener.
+    patch_rx: Option<mpsc::Receiver<TreePatch>>,
     done: bool,
 }
 
 impl StatusPanel {
-    fn new(display_name: String, username: String, role_label: String) -> Self {
+    fn new(display_name: String, username: String, role_label: String, patch_rx: mpsc::Receiver<TreePatch>) -> Self {
         let initials = display_name
             .split_whitespace()
             .filter_map(|w| w.chars().next())
@@ -171,6 +185,7 @@ impl StatusPanel {
             is_loading: false,
             search_query: String::new(),
             prev_phase: SyncPhase::Idle,
+            patch_rx: Some(patch_rx),
             done: false,
         }
     }
@@ -185,6 +200,10 @@ fn load_folders_from_config() -> (Vec<FolderSelection>, String) {
 
 impl eframe::App for StatusPanel {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Exit immediately if the tray has requested a global shutdown.
+        if crate::ui::common::is_shutdown_requested() {
+            std::process::exit(0);
+        }
         // Poll progress file every 500 ms
         if self.last_poll.elapsed() >= std::time::Duration::from_millis(500) {
             self.progress = read_progress_file();
@@ -196,6 +215,29 @@ impl eframe::App for StatusPanel {
             self.selected_folders = folders;
             self.sync_folder = sf;
             self.config_last_poll = std::time::Instant::now();
+        }
+        // Drain company-assignment patches: on any change, force config reload and
+        // silently refresh the Files tab so the new/removed folder appears immediately.
+        let has_patch = self.patch_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).count() > 0)
+            .unwrap_or(false);
+        if has_patch {
+            let (folders, sf) = load_folders_from_config();
+            self.selected_folders = folders;
+            self.sync_folder = sf.clone();
+            self.config_last_poll = std::time::Instant::now();
+            // Silently refresh Files tab if currently browsing
+            if self.active_tab == BrowserTab::Files
+                && !self.nav_stack.is_empty()
+                && self.load_rx.is_none()
+                && !self.is_loading
+            {
+                if let Some(current) = self.nav_stack.last().cloned() {
+                    let root = std::path::PathBuf::from(&sf);
+                    self.load_rx = Some(start_load(current, root));
+                }
+            }
+            ctx.request_repaint();
         }
         // Auto-refresh file browser when a sync cycle finishes (Syncing → Idle/Error).
         // The sync cycle is triggered by the WS event, so this fires shortly after

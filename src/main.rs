@@ -11,8 +11,11 @@ mod ui;
 mod ws;
 
 use std::env;
+use std::sync::mpsc;
+use std::sync::atomic::Ordering;
 use single_instance::SingleInstance;
 use tracing::{error, info, warn};
+use ws::events::TreePatchAction;
 use tracing_subscriber::{fmt, EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn main() {
@@ -51,6 +54,9 @@ fn main() {
     // Register Windows AppUserModelID so toast notifications show our icon
     // (not the PowerShell / generic icon).  Safe to call on every launch.
     ui::common::register_notification_app_id();
+    // Clear stale shutdown flag from a previous crash so subprocesses don't
+    // exit immediately on the next launch.
+    ui::common::clear_shutdown_flag();
 
     // Parse CLI arguments
     let args: Vec<String> = env::args().collect();
@@ -426,30 +432,98 @@ fn main() {
     // early when the user saves new folder selections in Manage Folders.
     let sync_trigger = std::sync::Arc::new(tokio::sync::Notify::new());
 
-    // Spawn background sync engine
-    {
+    // Spawn background sync engine — keep abort_flag handle to cancel on company removal
+    let abort_flag = {
         let sync_auth = auth_state.clone();
         let sync_progress = progress.clone();
         let engine_trigger = sync_trigger.clone();
+        let engine = sync::SyncEngine::new(sync_auth, sync_progress);
+        let flag = engine.abort_flag();
+        rt.spawn(async move { engine.run(engine_trigger).await; });
+        flag
+    };
+
+    // Spawn WebSocket listener — wakes the sync engine on CLOUD_FILE events.
+    // Also listens for company_supervisor.changed so the tray can abort sync
+    // immediately if a company is removed while a cycle is running.
+    let (patch_tx, patch_rx) = mpsc::channel::<ws::events::TreePatch>();
+    {
+        let ws_config = config.clone();
+        let ws_auth   = auth_state.clone();
+        let ws_trigger = sync_trigger.clone();
         rt.spawn(async move {
-            let engine = sync::SyncEngine::new(sync_auth, sync_progress);
-            engine.run(engine_trigger).await;
+            let my_username = ws_auth.current_username().await.unwrap_or_default();
+            ws::WsClient::run(ws_config, ws_auth, ws_trigger, Some((my_username, patch_tx))).await;
         });
     }
 
-    // Spawn WebSocket listener — wakes the sync engine on CLOUD_FILE events
-    let ws_config = config.clone();
-    let ws_auth = auth_state.clone();
-    let ws_trigger = sync_trigger.clone();
-    rt.spawn(async move {
-        // Tray process: no tree-patch channel needed (None).
-        ws::WsClient::run(ws_config, ws_auth, ws_trigger, None).await;
-    });
+    // Bridge: handle company-assignment patches in the tray process.
+    //   Removed → abort current sync cycle + remove company folders from config
+    //   Added   → trigger a new sync cycle so newly accessible folders are downloaded
+    {
+        let abort_for_patch  = abort_flag.clone();
+        let trigger_for_patch = sync_trigger.clone();
+        std::thread::spawn(move || {
+            while let Ok(patch) = patch_rx.recv() {
+                match patch.action {
+                    TreePatchAction::Removed => {
+                        warn!("Company '{}' removed — aborting sync and cleaning config",
+                            patch.company_name);
+                        abort_for_patch.store(true, Ordering::Relaxed);
+                        remove_company_from_config(&patch.company_name);
+                        // Trigger a new cycle: the engine will reload config (without
+                        // the removed company) and reset the abort flag.
+                        trigger_for_patch.notify_one();
+                        // Toast notification — already on a background thread, safe to call.
+                        let name = patch.company_name.clone();
+                        std::thread::spawn(move || {
+                            ui::common::show_company_removed_notification(&name);
+                        });
+                    }
+                    TreePatchAction::Added => {
+                        info!("Company '{}' added — triggering sync", patch.company_name);
+                        trigger_for_patch.notify_one();
+                        // Toast notification — spawn sub-thread to avoid blocking the bridge.
+                        let name = patch.company_name.clone();
+                        std::thread::spawn(move || {
+                            ui::common::show_company_assigned_notification(&name);
+                        });
+                    }
+                }
+            }
+        });
+    }
 
     // Run system tray on the main thread (blocks with Windows message pump)
     info!("Starting system tray...");
     tray::run_tray(&auth_state, &config, &rt, progress, sync_trigger);
     info!("Tray exited — shutting down");
+}
+
+/// Remove all selected folder entries that belong to a company from the persisted config.
+/// Called when a `company_supervisor.changed { action: "removed" }` event is received so
+/// the sync engine won't attempt to sync inaccessible folders on the next cycle.
+///
+/// Matches by company name prefix in `FolderSelection.path` (e.g. "Acme Corp / Projects")
+/// since the CloudFile UUID in the selection differs from the Company entity UUID in the event.
+fn remove_company_from_config(company_name: &str) {
+    match config::AppConfig::load_or_create() {
+        Ok(mut cfg) => {
+            let before = cfg.selected_folders.len();
+            cfg.selected_folders.retain(|sel| {
+                let top = sel.path.split(" / ").next().unwrap_or("").trim();
+                top != company_name && sel.name != company_name
+            });
+            let removed = before - cfg.selected_folders.len();
+            if removed > 0 {
+                info!("Removed {removed} folder selection(s) for company '{company_name}'");
+                if let Err(e) = cfg.save() {
+                    error!("Failed to save config after company removal: {e}");
+                }
+            }
+        }
+        Err(e) => error!("Could not load config to remove company folders: {e}"),
+    }
 }
 
 /// Show a Windows MessageBox so errors are visible even without a console.

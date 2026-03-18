@@ -184,14 +184,29 @@ Section "Uninstall"
     DeleteRegKey HKCU "${PRODUCT_DIR_REGKEY}"
 
     ; ── Remove all app data ──────────────────────────────────────────────────
-    ; Config, logs, sync state: %APPDATA%\AGBroadband\AGBCloudClient
+
+    ; Config, logs, sync state (current app name used by dirs crate)
     RMDir /r "$APPDATA\AGBroadband\AGBCloudClient"
-    ; Try to remove the parent dir too (succeeds only if empty — no other AGB apps)
+    ; Legacy folder created by older builds that used "CloudFilesSetup" as app name
+    RMDir /r "$APPDATA\AGBroadband\CloudFilesSetup"
+    ; Try to remove the parent dir (succeeds only if empty — no other AGB apps remain)
     RMDir "$APPDATA\AGBroadband"
 
-    ; Progress IPC file + any remaining install files: %LOCALAPPDATA%\AGBroadband\AGBCloudClient
+    ; Progress IPC file + any remaining install files (current)
     RMDir /r "$LOCALAPPDATA\AGBroadband\AGBCloudClient"
+    ; Legacy %LOCALAPPDATA% folder from older builds
+    RMDir /r "$LOCALAPPDATA\AGBroadband\CloudFilesSetup"
     RMDir "$LOCALAPPDATA\AGBroadband"
+
+    ; ── Temp / IPC flag files ─────────────────────────────────────────────────
+    ; Written by the tray process for ghost-icon cleanup and cross-process signaling.
+    Delete "$TEMP\agb_tray_hwnd.dat"
+    Delete "$TEMP\agb_tray_quit.flag"
+    Delete "$TEMP\agb_shutdown.flag"
+
+    ; ── Tray notification-area cache (prevents ghost icons after reinstall) ────
+    DeleteRegValue HKCU "Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify" "IconStreams"
+    DeleteRegValue HKCU "Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify" "PastIconsStream"
 
     ; Note: The sync folder (downloaded files, e.g. ~/CloudFiles) is intentionally
     ; preserved — it contains the user's own files, not app data.

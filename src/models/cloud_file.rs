@@ -69,25 +69,14 @@ pub struct SyncedFile {
     pub size: Option<i64>,
 }
 
-/// Sync policy for a selected folder
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum SyncPolicy {
-    /// Download once
-    Copy,
-    /// Keep synchronized periodically
-    KeepSynced { interval_secs: u64 },
-}
-
-/// User selection for a folder to sync
+/// User selection for a folder to sync.
+/// Selected folders are always kept in sync via WebSocket events + periodic engine cycles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FolderSelection {
     pub uuid: String,
     pub name: String,
     /// Visual path: "ROOT / subfolder / child"
     pub path: String,
-    pub policy: SyncPolicy,
-    /// true if Copy already executed
-    pub completed: bool,
 }
 
 /// WebSocket events from the server for real-time updates

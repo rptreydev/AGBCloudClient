@@ -12,6 +12,54 @@ use crate::sync::SharedProgress;
 
 type Children = Arc<Mutex<Vec<std::process::Child>>>;
 
+// ── Duplicate-instance guard ───────────────────────────────────────────────────
+
+/// Count how many instances of the current executable are alive (including self).
+/// Used to prevent a duplicate tray icon when a race condition leaves two
+/// processes alive simultaneously (e.g. Explorer restart during wizard hand-off).
+#[cfg(target_os = "windows")]
+fn count_running_instances() -> u32 {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::tlhelp32::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
+        PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+
+    let exe_name = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_lowercase))
+        .unwrap_or_else(|| "agb-cloud-client.exe".to_string());
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return 1; // Can't enumerate — assume we're the only one
+    }
+
+    let mut count = 0u32;
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
+        loop {
+            let raw = OsString::from_wide(&entry.szExeFile);
+            let name = raw.to_string_lossy().trim_end_matches('\0').to_lowercase();
+            if name == exe_name {
+                count += 1;
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
+                break;
+            }
+        }
+    }
+    unsafe { CloseHandle(snapshot) };
+    count
+}
+
+#[cfg(not(target_os = "windows"))]
+fn count_running_instances() -> u32 { 1 }
+
 /// IDs of the context menu items (stored so we can match events).
 struct MenuIds {
     status:  tray_icon::menu::MenuId,
@@ -65,12 +113,115 @@ pub fn run_tray(
     progress: SharedProgress,
     sync_trigger: std::sync::Arc<tokio::sync::Notify>,
 ) {
+    // ── Duplicate-process guard ───────────────────────────────────────────────
+    // Before registering the tray icon, verify no other tray instance of this
+    // executable is running.  Prevents a duplicate icon when Explorer restarts
+    // while a race between the old and new tray process is still in progress.
+    //
+    // Strategy: if count > 1, the extra process may be a SHORT-LIVED parent
+    // (e.g. the setup wizard, which intentionally sleeps ~800 ms after spawning
+    // us before calling exit(0)).  We wait up to 2 s in short bursts to give
+    // those transient processes time to exit.  Only after 2 s with count still
+    // > 1 do we treat it as a genuine duplicate tray and bail out.
+    {
+        let mut instances = count_running_instances();
+        if instances > 1 {
+            info!(
+                "Duplicate tray guard: {} instances detected — waiting up to 2 s \
+                 for transient processes (e.g. setup wizard) to exit",
+                instances
+            );
+            for _ in 0u8..8 {   // 8 × 250 ms = 2 s maximum wait
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                instances = count_running_instances();
+                if instances <= 1 {
+                    info!("Transient process exited — proceeding with tray icon creation");
+                    break;
+                }
+            }
+        }
+        if instances > 1 {
+            warn!(
+                "Duplicate tray guard: {} instances still present after 2 s — \
+                 another process already owns the tray icon. Exiting.",
+                instances
+            );
+            std::process::exit(0);
+        }
+    }
+
     let mut is_auth = rt.block_on(auth.is_authenticated());
 
     let (menu, menu_ids) = build_context_menu();
 
+    // ── Ghost icon cleanup ────────────────────────────────────────────────────
+    // When a tray process is force-killed (Ctrl+C, taskkill /F, power loss),
+    // Shell_NotifyIcon(NIM_DELETE) is never called, leaving a stale (HWND, uID)
+    // entry in Explorer's TrayNotify registry cache.  When Explorer restarts it
+    // restores these ghost icons alongside our new NIM_ADD → 2 icons visible.
+    //
+    // Fix: the previous run stored its HWND in a temp file.  We read it here and
+    // call NIM_DELETE for that old HWND BEFORE creating our new icon.  Explorer
+    // removes the ghost immediately, then our NIM_ADD registers exactly 1 icon.
+    // We also enumerate any live "tray_icon_app" windows (race-condition safety).
+    #[cfg(target_os = "windows")]
+    {
+        use winapi::um::shellapi::{NIM_DELETE, NOTIFYICONDATAW};
+        use winapi::um::winuser::{FindWindowExW, FindWindowW};
+
+        let hwnd_file = std::env::temp_dir().join("agb_tray_hwnd.dat");
+
+        // (a) Remove ghost from previous run via stored HWND
+        if let Ok(data) = std::fs::read_to_string(&hwnd_file) {
+            if let Ok(hwnd_val) = data.trim().parse::<usize>() {
+                // tray-icon 0.19 uses an incrementing counter for uID; the first
+                // (and normally only) TrayIcon per process gets uID = 1.  We try
+                // 1–3 to be safe against retry attempts that incremented the counter.
+                for uid in 1u32..=3 {
+                    let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+                    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                    nid.hWnd = hwnd_val as winapi::shared::windef::HWND;
+                    nid.uID = uid;
+                    unsafe { winapi::um::shellapi::Shell_NotifyIconW(NIM_DELETE, &mut nid); }
+                }
+                info!("Ghost icon cleanup: NIM_DELETE for previous HWND {hwnd_val:#x}");
+            }
+        }
+
+        // (b) Also remove any live "tray_icon_app" windows (handles the rare race
+        //     where a previous instance hasn't fully exited yet).
+        unsafe {
+            let class: Vec<u16> = "tray_icon_app\0".encode_utf16().collect();
+            let mut hwnd = FindWindowW(class.as_ptr(), std::ptr::null_mut());
+            while !hwnd.is_null() {
+                for uid in 1u32..=3 {
+                    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+                    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                    nid.hWnd = hwnd;
+                    nid.uID = uid;
+                    winapi::um::shellapi::Shell_NotifyIconW(NIM_DELETE, &mut nid);
+                }
+                info!("Ghost icon cleanup: live tray_icon_app HWND {hwnd:?}");
+                hwnd = FindWindowExW(
+                    std::ptr::null_mut(), hwnd,
+                    class.as_ptr(), std::ptr::null_mut(),
+                );
+            }
+        }
+    }
+
     // Retry tray icon creation — the notification area may not be fully
     // initialized if Explorer was just restarted.
+    //
+    // IMPORTANT: if TrayIconBuilder::build() fails (Shell_NotifyIcon(NIM_ADD)
+    // returns FALSE because Shell_TrayWnd is not ready), tray-icon internally
+    // creates a hidden HWND but does NOT destroy it on error.  That leaked HWND
+    // has an active WNDPROC that will handle WM_TASKBARCREATED and call NIM_ADD
+    // on its own when Explorer finishes starting.  If the retry loop then also
+    // calls NIM_ADD via a new successful build(), we end up with 2 icons.
+    //
+    // Defence: after each failed attempt, find and DestroyWindow any leaked
+    // "tray_icon_app" windows so their WNDPROC can no longer fire NIM_ADD.
     let tray_icon = {
         let mut attempt = 0u32;
         loop {
@@ -92,6 +243,25 @@ pub fn run_tray(
                 }
                 Err(e) if attempt < 5 => {
                     warn!("Tray icon creation failed (attempt {attempt}/5): {e} — retrying in 1s");
+
+                    // Destroy any leaked "tray_icon_app" HWNDs from the failed
+                    // build() so their WNDPROC cannot register a ghost icon when
+                    // WM_TASKBARCREATED fires during the 1-second sleep below.
+                    #[cfg(target_os = "windows")]
+                    unsafe {
+                        use winapi::um::winuser::{DestroyWindow, FindWindowExW, FindWindowW};
+                        let class: Vec<u16> = "tray_icon_app\0".encode_utf16().collect();
+                        let mut leaked = FindWindowW(class.as_ptr(), std::ptr::null_mut());
+                        while !leaked.is_null() {
+                            let next = FindWindowExW(
+                                std::ptr::null_mut(), leaked,
+                                class.as_ptr(), std::ptr::null_mut(),
+                            );
+                            DestroyWindow(leaked);
+                            leaked = next;
+                        }
+                    }
+
                     std::thread::sleep(std::time::Duration::from_secs(1));
                 }
                 Err(e) => {
@@ -101,6 +271,22 @@ pub fn run_tray(
             }
         }
     };
+
+    // Store our hidden HWND so the NEXT run can call NIM_DELETE for it on startup,
+    // preventing ghost icons when this process dies without calling NIM_DELETE.
+    #[cfg(target_os = "windows")]
+    {
+        use winapi::um::winuser::FindWindowW;
+        let hwnd_file = std::env::temp_dir().join("agb_tray_hwnd.dat");
+        unsafe {
+            let class: Vec<u16> = "tray_icon_app\0".encode_utf16().collect();
+            let hwnd = FindWindowW(class.as_ptr(), std::ptr::null_mut());
+            if !hwnd.is_null() {
+                let _ = std::fs::write(&hwnd_file, format!("{}", hwnd as usize));
+                info!("Stored tray HWND {:#x} for next-run ghost cleanup", hwnd as usize);
+            }
+        }
+    }
 
     info!("System tray running (context menu enabled, authenticated: {is_auth})");
 
@@ -123,8 +309,16 @@ pub fn run_tray(
     #[cfg(target_os = "windows")]
     {
         use std::mem::zeroed;
-        use winapi::um::winuser::{DispatchMessageW, PeekMessageW, TranslateMessage, PM_REMOVE, MSG};
+        use winapi::um::winuser::{
+            DispatchMessageW, PeekMessageW,
+            TranslateMessage, PM_REMOVE, MSG,
+        };
 
+        // tray-icon 0.19 handles WM_TASKBARCREATED internally in its WNDPROC:
+        // it calls Shell_NotifyIcon(NIM_DELETE) then Shell_NotifyIcon(NIM_ADD)
+        // with the same HWND/uID, giving exactly one icon after Explorer restart.
+        // We rely on that built-in handler — our own intercept was causing a
+        // second NIM_ADD (one from tray-icon's WNDPROC + one from our rebuild).
         loop {
             unsafe {
                 let mut msg: MSG = zeroed();
@@ -216,12 +410,14 @@ pub fn run_tray(
                         }
                     }
                     kill_all_children(&children);
-                    drop(tray_icon);
+                    // Do NOT drop(tray_icon) — Shell_NotifyIcon(NIM_DELETE) can block
+                    // if Explorer is unresponsive, preventing exit(0) from being reached.
+                    // Windows automatically destroys HWNDs (and removes the tray icon)
+                    // when the process exits. Ghost-icon cleanup runs on next launch.
                     std::process::exit(0);
                 } else if event.id == menu_ids.quit {
                     info!("Menu: Quit");
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 }
             }
@@ -240,6 +436,16 @@ pub fn run_tray(
                 // Clean up subprocesses that have already exited naturally
                 if let Ok(mut c) = children.lock() {
                     c.retain_mut(|child| child.try_wait().map(|s| s.is_none()).unwrap_or(true));
+                }
+                // Graceful-quit signal written by a new tray instance (--from-wizard
+                // reinstall path) to avoid ghost icons from force-kill.
+                // Presence of the flag file → delete it, drop icon (NIM_DELETE), exit.
+                let quit_flag = std::env::temp_dir().join("agb_tray_quit.flag");
+                if quit_flag.exists() {
+                    let _ = std::fs::remove_file(&quit_flag);
+                    info!("Graceful-quit flag detected — releasing tray icon and exiting");
+                    kill_all_children(&children);
+                    std::process::exit(0);
                 }
             }
 
@@ -260,7 +466,6 @@ pub fn run_tray(
                 if sig.quit_requested {
                     info!("Quit signal received from status panel — terminating");
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 }
                 if sig.logout_requested {
@@ -272,7 +477,6 @@ pub fn run_tray(
                         }
                     }
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 }
                 if sig.sync_requested {
@@ -331,11 +535,9 @@ pub fn run_tray(
                         let _ = std::process::Command::new(&exe).arg("--login").spawn();
                     }
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 } else if event.id == menu_ids.quit {
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 }
             }
@@ -366,7 +568,6 @@ pub fn run_tray(
                 let mut sig = read_progress_file();
                 if sig.quit_requested {
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 }
                 if sig.logout_requested {
@@ -375,7 +576,6 @@ pub fn run_tray(
                         let _ = std::process::Command::new(&exe).arg("--login").spawn();
                     }
                     kill_all_children(&children);
-                    drop(tray_icon);
                     std::process::exit(0);
                 }
                 if sig.sync_requested {
@@ -419,7 +619,11 @@ fn spawn_ui_subprocess(flag: &str, children: &Children) {
 
 /// Kill all tracked subprocesses (Settings, Manage Folders, Status windows).
 /// Called on Quit so all open windows are closed with the tray.
+/// Also writes the shutdown flag so any subprocess from a previous session exits too.
 fn kill_all_children(children: &Children) {
+    // Signal flag first — catches orphaned subprocesses not in `children`
+    // (e.g. opened during a previous tray session that was later restarted).
+    crate::ui::common::request_shutdown();
     if let Ok(mut c) = children.lock() {
         for child in c.iter_mut() {
             let pid = child.id();

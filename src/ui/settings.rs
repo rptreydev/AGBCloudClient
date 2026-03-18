@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::mpsc;
 use eframe::egui;
 use tracing::{error, info};
 
@@ -8,6 +9,7 @@ use crate::models::FolderSelection;
 use crate::sync::progress::SharedProgress;
 use crate::ui::common::*;
 use crate::ui::folder_tree::FolderTreeWidget;
+use crate::ws::events::WsClient;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab { Folders, General, Shortcuts }
@@ -37,9 +39,21 @@ impl SettingsApp {
     fn new(config: &AppConfig, auth: AuthState, handle: tokio::runtime::Handle, progress: SharedProgress) -> Self {
         let sync_folder = config.sync_folder.clone();
         let (disk_total, disk_free) = get_disk_space(&sync_folder).unwrap_or((0, 0));
+
+        // Wire a WS listener so company-assignment changes update the tree in real-time.
+        let (patch_tx, patch_rx) = mpsc::channel();
+        let ws_auth   = auth.clone();
+        let ws_config = config.clone();
+        let dummy_trigger = Arc::new(tokio::sync::Notify::new());
+        handle.spawn(async move {
+            let my_username = ws_auth.current_username().await.unwrap_or_default();
+            WsClient::run(ws_config, ws_auth, dummy_trigger, Some((my_username, patch_tx))).await;
+        });
+
         let mut tree = FolderTreeWidget::new(auth.clone(), handle)
             .with_initial_selections(&config.selected_folders)
-            .with_auto_expand(false); // Browse mode: checkmarks visible but no auto-expand
+            .with_auto_expand(false) // Browse mode: checkmarks visible but no auto-expand
+            .with_patch_rx(patch_rx);
         tree.fetch_roots();
         Self {
             active_tab: Tab::Folders,
@@ -116,19 +130,11 @@ impl eframe::App for SettingsApp {
                 }
             });
             ui.add_space(4.0);
-            ui.separator();
         });
 
         // Footer
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.add_space(8.0);
-            let unset = self.tree.unset_count();
-            if unset > 0 {
-                ui.label(egui::RichText::new(format!(
-                    "! {unset} item(s) need a Copy or Sync policy assigned"
-                )).size(11.0).color(WARNING_COLOR));
-                ui.add_space(4.0);
-            }
             // Show save feedback message
             let show_msg = self.save_time
                 .map(|t| t.elapsed().as_secs_f32() < 4.0)
@@ -330,7 +336,6 @@ impl SettingsApp {
         // ── Disk usage bar (compact, at the bottom) ───────────────────────────
         if self.disk_total > 0 {
             ui.add_space(4.0);
-            ui.separator();
             ui.add_space(2.0);
             let used = self.disk_total - self.disk_free;
             let selected = self.selected_size();
@@ -633,6 +638,10 @@ struct SettingsWrapper {
 
 impl eframe::App for SettingsWrapper {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Exit immediately if the tray has requested a global shutdown.
+        if crate::ui::common::is_shutdown_requested() {
+            std::process::exit(0);
+        }
         self.inner.update(ctx, frame);
 
         // Handle save (window stays open)

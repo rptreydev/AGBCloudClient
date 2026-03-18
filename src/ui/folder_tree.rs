@@ -11,7 +11,7 @@ use eframe::egui;
 use tracing::{error, info};
 
 use crate::auth::AuthState;
-use crate::models::{CloudFile, FolderSelection};
+use crate::models::FolderSelection;
 use crate::sync::remote::RemoteClient;
 use crate::ui::common::*;
 use crate::ws::events::{TreePatch, TreePatchAction};
@@ -48,6 +48,9 @@ pub struct FolderTreeWidget {
     /// Optional receiver for real-time company-assignment delta updates.
     /// Set via [`set_patch_rx`] from the Folder Manager subprocess.
     patch_rx: Option<mpsc::Receiver<TreePatch>>,
+    /// UUIDs that were expanded before a patch-triggered fetch_roots().
+    /// Restored in FetchResult::Roots so the user doesn't lose their view state.
+    restore_expanded: HashSet<String>,
 }
 
 impl FolderTreeWidget {
@@ -66,6 +69,7 @@ impl FolderTreeWidget {
             pending_fetches: VecDeque::new(),
             auto_expand: true,
             patch_rx: None,
+            restore_expanded: HashSet::new(),
         }
     }
 
@@ -161,6 +165,11 @@ impl FolderTreeWidget {
             match result {
                 FetchResult::Roots(roots) => {
                     self.roots = roots.into_iter().map(TreeNode::from_cloud_file).collect();
+                    // Restore expanded state saved before a patch-triggered reload.
+                    if !self.restore_expanded.is_empty() {
+                        restore_expanded_state(&mut self.roots, &self.restore_expanded);
+                        self.restore_expanded.clear();
+                    }
                     // After loading roots, rebuild ancestor markers so that any root-level
                     // ancestor of a pre-loaded explicit selection shows as checked.
                     self.rebuild_ancestor_markers();
@@ -283,8 +292,27 @@ impl FolderTreeWidget {
                 }
                 TreeAction::Deselect(uuid) => {
                     self.selected.remove(&uuid);
+                    // Remove loaded descendants from selected
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
                         self.selected.remove(&d);
+                    }
+                    // CRITICAL: also purge unloaded descendants from initial_selections
+                    // and selected. `collect_descendant_uuids` only sees loaded tree nodes;
+                    // if the user never expanded a branch, its children stay in `selected`
+                    // as Some(true) and the build_selections fallback would re-include them.
+                    // Solution: use build_path() to get this node's full path, then remove
+                    // every initial_selection whose path equals or starts with that prefix.
+                    let node_path = crate::ui::common::build_path(&self.roots, &uuid);
+                    if !node_path.is_empty() {
+                        let prefix_slash = format!("{node_path} / ");
+                        let orphaned: Vec<String> = self.initial_selections.iter()
+                            .filter(|s| s.path == node_path || s.path.starts_with(&prefix_slash))
+                            .map(|s| s.uuid.clone())
+                            .collect();
+                        for u in &orphaned { self.selected.remove(u); }
+                        self.initial_selections.retain(|s| {
+                            s.path != node_path && !s.path.starts_with(&prefix_slash)
+                        });
                     }
                     // Clean up ancestor markers bottom-up when no selected descendants remain
                     let mut ancestors = find_ancestor_uuids(&self.roots, &uuid);
@@ -445,55 +473,37 @@ impl FolderTreeWidget {
     fn apply_tree_patch(&mut self, patch: TreePatch) {
         match patch.action {
             TreePatchAction::Added => {
-                // Avoid duplicates (event may fire twice on reconnect).
-                if self.roots.iter().any(|n| n.file.uuid == patch.company_uuid) {
-                    return;
-                }
-                let cf = CloudFile {
-                    id:           None,
-                    uuid:         patch.company_uuid.clone(),
-                    name:         patch.company_name.clone(),
-                    folder:       true,
-                    no_file:      None,
-                    size:         None,
-                    ext:          None,
-                    hash:         None,
-                    mime:         None,
-                    is_protected: None,
-                    password:     None,
-                    has_gps:      None,
-                    created:      None,
-                    updated:      None,
-                    deleted:      None,
-                    children:     Some(Vec::new()),
-                };
-                info!("FolderTree: company added — inserting root '{}'", patch.company_name);
-                self.roots.insert(0, TreeNode::from_cloud_file(cf));
+                // We cannot create a valid stub: `company_uuid` is the CompanySupervisor UUID,
+                // not the CloudFile root UUID. Expanding a stub would trigger a 404 on the API.
+                // Solution: refresh the roots list from the API — the new root will appear with
+                // its correct CloudFile UUID. User selections are preserved (indexed by UUID).
+                info!("FolderTree: company '{}' assigned — refreshing roots", patch.company_name);
+                // Spawn a thread: notify_rust::Notification::show() must not be called
+                // from the eframe UI thread or it may silently fail on Windows.
+                let name = patch.company_name.clone();
+                std::thread::spawn(move || {
+                    crate::ui::common::show_company_assigned_notification(&name);
+                });
+                // Save expanded state so the user doesn't lose their view after reload.
+                self.restore_expanded = collect_expanded_uuids(&self.roots);
+                self.fetch_roots();
             }
             TreePatchAction::Removed => {
-                let before = self.roots.len();
-                self.roots.retain(|n| n.file.uuid != patch.company_uuid);
-                if self.roots.len() < before {
-                    info!("FolderTree: company removed — dropping root '{}'", patch.company_name);
-                    // Clean up all selections that belonged to this company root.
-                    let to_remove: Vec<String> = self.selected.keys()
-                        .filter(|uuid| {
-                            // Remove the company uuid itself and any descendant that
-                            // matches (descendant uuids can't be recovered once node
-                            // is gone, so clear only exact uuid and initial_selections).
-                            **uuid == patch.company_uuid
-                        })
-                        .cloned()
-                        .collect();
-                    for uuid in to_remove {
-                        self.selected.remove(&uuid);
-                    }
-                    // Also remove initial_selections that belonged to this company.
-                    self.initial_selections.retain(|s| {
-                        !s.path.starts_with(&patch.company_name)
-                            && s.uuid != patch.company_uuid
-                    });
-                }
+                // `patch.company_uuid` is the Company entity UUID, not the CloudFile root UUID —
+                // they are different, so we cannot match by UUID directly.
+                // Reload roots from the API: the removed company will no longer appear because
+                // the backend filters by current supervisor assignments. Selections for nodes
+                // that are no longer returned will become orphaned (no visible node) but won't
+                // cause errors — they are simply ignored by the engine if the folder is gone.
+                info!("FolderTree: company '{}' removed — refreshing roots", patch.company_name);
+                // Notify the user that access was revoked.
+                let name = patch.company_name.clone();
+                std::thread::spawn(move || {
+                    crate::ui::common::show_company_removed_notification(&name);
+                });
+                // Save expanded state so the user doesn't lose their view after reload.
+                self.restore_expanded = collect_expanded_uuids(&self.roots);
+                self.fetch_roots();
             }
         }
     }
@@ -581,6 +591,38 @@ fn set_node_expanded(nodes: &mut [TreeNode], uuid: &str) {
         // uninitialised child vecs.
         if node.children_loaded {
             set_node_expanded(&mut node.children, uuid);
+        }
+    }
+}
+
+
+/// Collect the UUIDs of all currently-expanded nodes (recursively).
+/// Used to save view state before a patch-triggered fetch_roots() reload.
+fn collect_expanded_uuids(nodes: &[TreeNode]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_expanded_uuids_inner(nodes, &mut out);
+    out
+}
+
+fn collect_expanded_uuids_inner(nodes: &[TreeNode], out: &mut HashSet<String>) {
+    for node in nodes {
+        if node.expanded {
+            out.insert(node.file.uuid.clone());
+            collect_expanded_uuids_inner(&node.children, out);
+        }
+    }
+}
+
+/// Set `expanded = true` for every node whose UUID is in `to_restore` (recursively).
+/// Only touches root-level nodes that are matched by UUID — their children are
+/// not loaded after a fresh fetch_roots(), so we only mark the roots themselves.
+fn restore_expanded_state(nodes: &mut [TreeNode], to_restore: &HashSet<String>) {
+    for node in nodes.iter_mut() {
+        if to_restore.contains(&node.file.uuid) {
+            node.expanded = true;
+        }
+        if node.children_loaded {
+            restore_expanded_state(&mut node.children, to_restore);
         }
     }
 }

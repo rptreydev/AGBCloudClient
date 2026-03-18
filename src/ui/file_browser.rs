@@ -71,6 +71,10 @@ impl FileBrowserApp {
 
 impl eframe::App for FileBrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Exit immediately if the tray has requested a global shutdown.
+        if crate::ui::common::is_shutdown_requested() {
+            std::process::exit(0);
+        }
         // Install image loaders once (needed for image preview via egui_extras)
         egui_extras::install_image_loaders(ctx);
 
@@ -141,14 +145,19 @@ impl eframe::App for FileBrowserApp {
                     let count = self.tree.build_selections().len();
                     ui.label(egui::RichText::new(format!("{count} item(s) selected")).size(12.0).color(TEXT_SECONDARY));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let has_selections = count > 0;
+                        // Allow saving even when count = 0 so the user can stop sync entirely.
+                        // Disabling the button when nothing is selected traps the user:
+                        // they can't persist their "deselect all" choice and the old
+                        // selections survive the next restart.
+                        let label = if count == 0 { "Stop Sync" } else { "Confirm & Start Sync" };
+                        let fill  = if count == 0 { egui::Color32::from_rgb(160, 60, 60) } else { ACCENT };
                         let btn = egui::Button::new(
-                            egui::RichText::new("Confirm & Start Sync").size(14.0).color(TEXT_PRIMARY),
+                            egui::RichText::new(label).size(14.0).color(TEXT_PRIMARY),
                         )
                         .min_size(egui::vec2(180.0, 36.0))
                         .rounding(8.0)
-                        .fill(if has_selections { ACCENT } else { egui::Color32::from_rgb(50, 70, 100) });
-                        if ui.add_enabled(has_selections, btn)
+                        .fill(fill);
+                        if ui.add(btn)
                             .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
@@ -451,11 +460,10 @@ pub fn show_file_browser(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
         }),
     );
 
+    // Always apply saved selections — even an empty list is valid (user stopped sync).
     if let Ok(sels) = selections.lock() {
-        if !sels.is_empty() {
-            config.selected_folders = sels.clone();
-            info!("Saved {} folder selections to config", config.selected_folders.len());
-        }
+        config.selected_folders = sels.clone();
+        info!("Applied {} folder selection(s) from Folder Manager", config.selected_folders.len());
     }
 }
 

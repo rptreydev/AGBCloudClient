@@ -28,6 +28,8 @@ pub enum TreePatchAction {
 #[derive(Debug, Clone)]
 pub struct TreePatch {
     pub action:       TreePatchAction,
+    /// Company UUID from the backend event. Used in tests and kept for future filtering.
+    #[allow(dead_code)]
     pub company_uuid: String,
     pub company_name: String,
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
@@ -14,12 +15,20 @@ use crate::sync::remote::RemoteClient;
 pub struct SyncEngine {
     remote: RemoteClient,
     progress: SharedProgress,
+    /// Set to `true` from outside (e.g. when a company is removed while syncing)
+    /// to abort the current cycle immediately. Reset at the start of each cycle.
+    abort_flag: Arc<AtomicBool>,
 }
 
 impl SyncEngine {
     pub fn new(auth: AuthState, progress: SharedProgress) -> Self {
         let remote = RemoteClient::new(auth);
-        Self { remote, progress }
+        Self { remote, progress, abort_flag: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// Returns a handle to the abort flag so external code can cancel a running cycle.
+    pub fn abort_flag(&self) -> Arc<AtomicBool> {
+        self.abort_flag.clone()
     }
 
     /// Main sync loop — runs forever, driven purely by WS events.
@@ -58,7 +67,8 @@ impl SyncEngine {
             return;
         }
 
-        // Reset download counters for this cycle.
+        // Reset abort flag and download counters for this cycle.
+        self.abort_flag.store(false, Ordering::Relaxed);
         self.update_progress(|p| {
             p.files_downloaded = 0;
             p.files_synced = 0;
@@ -101,6 +111,13 @@ impl SyncEngine {
         info!("Syncing {} root selection(s)", selections.len());
 
         for sel in &selections {
+            if self.abort_flag.load(Ordering::Relaxed) {
+                warn!("Sync aborted — company removed during sync cycle");
+                self.update_progress(|p| {
+                    p.last_error = Some("Sync aborted: company access revoked".to_string());
+                });
+                return Ok(());
+            }
             self.update_progress(|p| {
                 p.phase = SyncPhase::Syncing;
                 p.current_folder = sel.name.clone();
@@ -127,7 +144,7 @@ impl SyncEngine {
             }
 
             let before = self.progress.lock().map(|p| p.files_downloaded).unwrap_or(0);
-            match self.sync_folder_recursive(&sel.uuid, &sel.name, &folder_path).await {
+            match self.sync_folder_recursive(&sel.uuid, &sel.name, &folder_path, base_path).await {
                 Ok(()) => {
                     let delta = self.progress.lock()
                         .map(|p| p.files_downloaded.saturating_sub(before))
@@ -158,6 +175,7 @@ impl SyncEngine {
         folder_uuid: &str,
         folder_name: &str,
         local_path: &Path,
+        sync_folder: &Path,
     ) -> Result<()> {
         self.update_progress(|p| {
             p.current_folder = folder_name.to_string();
@@ -176,19 +194,23 @@ impl SyncEngine {
         };
 
         for child in &children {
+            if self.abort_flag.load(Ordering::Relaxed) {
+                info!("Sync aborted mid-folder '{folder_name}' — stopping recursive sync");
+                return Ok(());
+            }
             if child.folder {
                 let child_path = local_path.join(child.name.trim());
                 if let Err(e) = tokio::fs::create_dir_all(&child_path).await {
                     error!("Failed to create dir {}: {e}", child_path.display());
                     continue;
                 }
-                if let Err(e) = Box::pin(self.sync_folder_recursive(&child.uuid, &child.name, &child_path)).await {
+                if let Err(e) = Box::pin(self.sync_folder_recursive(&child.uuid, &child.name, &child_path, sync_folder)).await {
                     error!("Failed to sync subfolder {}: {e}", child.name);
                     // Note: files_failed already incremented inside the recursive call
                 }
             } else {
                 let file_path = local_path.join(child.name.trim());
-                if let Err(e) = self.download_file_if_needed(child, &file_path).await {
+                if let Err(e) = self.download_file_if_needed(child, &file_path, sync_folder).await {
                     error!("Failed to download {}: {e}", child.name);
                     self.update_progress(|p| {
                         p.files_failed += 1;
@@ -202,7 +224,7 @@ impl SyncEngine {
     }
 
     /// Download a remote file if it doesn't exist locally yet.
-    async fn download_file_if_needed(&self, file: &CloudFile, dest: &Path) -> Result<()> {
+    async fn download_file_if_needed(&self, file: &CloudFile, dest: &Path, sync_folder: &Path) -> Result<()> {
         // Skip virtual entries that have no actual file stored on the server.
         if file.no_file == Some(true) {
             debug!("Skipping no_file entry: {}", file.name);
@@ -242,8 +264,23 @@ impl SyncEngine {
         let dest_str = dest.to_string_lossy().to_string();
         self.remote.download_file(&file.uuid, &dest_str).await?;
 
+        // Extract company / project / location from the path relative to sync_folder.
+        // Path structure: sync_folder / Company / Project / Location / file.jpg
+        // dest.parent() gives the folder that contains the file.
+        let path_parts: Vec<String> = dest.parent()
+            .and_then(|p| p.strip_prefix(sync_folder).ok())
+            .map(|rel| rel.components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect())
+            .unwrap_or_default();
+        let company  = path_parts.first().map(String::as_str);
+        let project  = path_parts.get(1).map(String::as_str);
+        let location = path_parts.get(2).map(String::as_str);
+
         // Notify only after a real download from a selected folder.
-        crate::ui::common::show_download_notification(&file.name, file.mime.as_deref());
+        crate::ui::common::show_download_notification(
+            &file.name, file.mime.as_deref(), company, project, location,
+        );
 
         self.update_progress(|p| {
             p.files_done += 1;
