@@ -1,4 +1,6 @@
-#![windows_subsystem = "windows"]
+// In release builds hide the console window (Windows GUI app).
+// In debug builds keep the console so `cargo run` shows live logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod auth;
 mod config;
@@ -25,6 +27,15 @@ fn main() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("agb_cloud_client=info"));
 
+    // In debug builds also print to stdout so `cargo run` shows live logs.
+    #[cfg(debug_assertions)]
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer().with_writer(file_appender))
+        .with(fmt::layer().with_writer(std::io::stdout))
+        .init();
+
+    #[cfg(not(debug_assertions))]
     tracing_subscriber::registry()
         .with(filter)
         .with(fmt::layer().with_writer(file_appender))
@@ -63,9 +74,21 @@ fn main() {
     // flag the fresh tray would detect "another instance running" and exit immediately,
     // causing the tray icon to never appear after first-time setup.
     let from_wizard = args.contains(&"--from-wizard".to_string());
+    // Passed by the wizard when it registered the Explorer sidebar, so that
+    // --from-wizard restarts Explorer AFTER killing the old tray.  This defers
+    // the blocking restart_explorer() call out of eframe's UI thread.
+    let restart_explorer_after_setup = args.contains(&"--restart-explorer".to_string());
 
-    // Single-instance check (skip during special UI modes — they run as subprocesses)
-    let _instance = if !force_setup && !manage_folders_mode && !settings_mode && !status_mode && !login_mode && !uninstall_mode && !from_wizard {
+    // Single-instance check
+    //
+    // Normal launch  → acquire mutex immediately; exit if another tray is running.
+    // --from-wizard  → kill any other running instance first (process enumeration,
+    //                  not mutex — mutex may be abandoned after abnormal exit),
+    //                  then acquire the mutex.
+    // Subprocesses   → no lock needed (short-lived UI helpers).
+    let _instance = if !force_setup && !manage_folders_mode && !settings_mode
+        && !status_mode && !login_mode && !uninstall_mode && !from_wizard
+    {
         let inst = SingleInstance::new("agb-cloud-client-agbroadband")
             .expect("Failed to create instance lock");
         if !inst.is_single() {
@@ -73,8 +96,115 @@ fn main() {
             std::process::exit(1);
         }
         Some(inst)
+    } else if from_wizard {
+        // ── Kill every other running instance FIRST (by process name, not mutex).
+        // The mutex may be abandoned (released by OS) even when the process is
+        // still alive, so we use process enumeration to detect and kill reliably.
+        // Phase 1: graceful quit (tray calls NIM_DELETE → clean icon removal).
+        // Phase 2: taskkill /F fallback + 2 s for Windows to sweep ghost icons.
+        // We do this BEFORE acquiring our own mutex so that restart_explorer()
+        // (called below) always starts with a clean notification area.
+        //
+        // All child commands use CREATE_NO_WINDOW (0x0800_0000) to avoid flashing
+        // a console window, since this binary runs as a Windows-subsystem app.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let cur_pid = std::process::id();
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_name = exe.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("agb-cloud-client.exe")
+                    .to_owned();
+
+                // Phase 1: graceful quit flag — old tray calls drop(tray_icon) then exits.
+                let quit_flag = std::env::temp_dir().join("agb_tray_quit.flag");
+                let _ = std::fs::write(&quit_flag, b"quit");
+                info!("--from-wizard: sent graceful-quit signal, waiting up to 2 s");
+
+                let mut others_alive = false;
+                for _ in 0..10u32 {           // 10 × 200 ms = 2 s
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    let out = std::process::Command::new("tasklist")
+                        .args(["/FI", &format!("IMAGENAME eq {}", exe_name),
+                               "/FI", &format!("PID ne {}", cur_pid), "/NH"])
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase())
+                        .unwrap_or_default();
+                    if out.contains(&exe_name.to_lowercase()) {
+                        others_alive = true;   // still alive — keep waiting
+                    } else {
+                        info!("--from-wizard: all other instances exited gracefully");
+                        others_alive = false;
+                        break;
+                    }
+                }
+                let _ = std::fs::remove_file(&quit_flag);
+
+                // Phase 2: force-kill if graceful quit timed out.
+                if others_alive {
+                    warn!("--from-wizard: graceful quit timed out — force-killing");
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/IM", &exe_name,
+                               "/FI", &format!("PID ne {}", cur_pid)])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                    // Give Windows 2 s to sweep the ghost notification-area entry.
+                    std::thread::sleep(std::time::Duration::from_millis(2000));
+                }
+            }
+        }
+
+        // ── Clear Windows notification-area icon cache BEFORE restarting Explorer.
+        // Windows stores cached tray icon states in the registry under TrayNotify.
+        // When Explorer restarts it restores these cached entries — including ghost
+        // icons from processes that no longer exist — which appear as duplicate icons
+        // alongside the new tray icon.  Deleting the cache forces Explorer to start
+        // with a clean notification area.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+            let key = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify";
+            for value in &["IconStreams", "PastIconsStream"] {
+                let _ = std::process::Command::new("reg")
+                    .args(["delete", key, "/v", value, "/f"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .status();
+            }
+            info!("--from-wizard: notification-area icon cache cleared");
+        }
+
+        // ── Restart Explorer now (AFTER old tray is dead + cache cleared) if the
+        // wizard registered the sidebar.  No old tray is alive to respond to
+        // WM_TASKBARCREATED, and the cache is clean, so only our new process will
+        // register an icon.
+        if restart_explorer_after_setup {
+            info!("--from-wizard: restarting Explorer to apply sidebar registration");
+            if let Err(e) = ui::common::restart_explorer() {
+                error!("Explorer restart failed: {e}");
+            }
+        }
+
+        // ── Acquire the SingleInstance mutex (old tray is dead, should succeed).
+        let inst = SingleInstance::new("agb-cloud-client-agbroadband")
+            .expect("Failed to create instance lock");
+        if !inst.is_single() {
+            warn!("--from-wizard: could not acquire mutex — another tray still running. Exiting.");
+            std::process::exit(0);
+        }
+        info!("--from-wizard: SingleInstance mutex acquired");
+        Some(inst)
     } else {
-        None
+        None // Subprocess modes (manage-folders, settings, status, login) — no lock
     };
 
     // Load or create config
@@ -307,13 +437,13 @@ fn main() {
         });
     }
 
-    // Spawn WebSocket listener for real-time events
+    // Spawn WebSocket listener — wakes the sync engine on CLOUD_FILE events
     let ws_config = config.clone();
     let ws_auth = auth_state.clone();
+    let ws_trigger = sync_trigger.clone();
     rt.spawn(async move {
-        if let Err(e) = ws::WsClient::connect(&ws_config, &ws_auth).await {
-            warn!("WebSocket connection failed: {e}");
-        }
+        // Tray process: no tree-patch channel needed (None).
+        ws::WsClient::run(ws_config, ws_auth, ws_trigger, None).await;
     });
 
     // Run system tray on the main thread (blocks with Windows message pump)

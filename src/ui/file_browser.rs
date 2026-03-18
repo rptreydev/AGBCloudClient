@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::mpsc;
 use eframe::egui;
 use tokio::runtime::Runtime;
 use tracing::info;
@@ -8,6 +9,7 @@ use crate::config::AppConfig;
 use crate::models::{CloudFile, FolderSelection};
 use crate::ui::common::*;
 use crate::ui::folder_tree::FolderTreeWidget;
+use crate::ws::events::WsClient;
 
 struct FileBrowserApp {
     tree: FolderTreeWidget,
@@ -21,11 +23,39 @@ struct FileBrowserApp {
 }
 
 impl FileBrowserApp {
-    fn new(auth: AuthState, handle: tokio::runtime::Handle, sync_folder: &str, saved_folders: &[FolderSelection]) -> Self {
+    fn new(
+        auth: AuthState,
+        handle: tokio::runtime::Handle,
+        sync_folder: &str,
+        saved_folders: &[FolderSelection],
+        config: crate::config::AppConfig,
+    ) -> Self {
         let (disk_total, disk_free) = get_disk_space(sync_folder).unwrap_or((0, 0));
+
+        // Create a channel so the WsClient can push company-assignment deltas
+        // directly into the folder tree without a full refresh.
+        let (patch_tx, patch_rx) = mpsc::channel();
+
+        // Spawn a lightweight WS listener in the background.  It only forwards
+        // company_supervisor.changed events to the tree; sync triggering is handled
+        // by the tray process, so we pass a no-op Notify here.
+        let ws_auth   = auth.clone();
+        let ws_config = config.clone();
+        let dummy_trigger = Arc::new(tokio::sync::Notify::new());
+        handle.spawn(async move {
+            let my_username = ws_auth.current_username().await.unwrap_or_default();
+            WsClient::run(
+                ws_config,
+                ws_auth,
+                dummy_trigger,
+                Some((my_username, patch_tx)),
+            ).await;
+        });
+
         let mut tree = FolderTreeWidget::new(auth, handle)
             .with_initial_selections(saved_folders)
-            .with_auto_expand(false); // Browse mode: don't shift the view by auto-expanding pre-selected folders
+            .with_auto_expand(false)  // Browse mode: don't auto-expand pre-selected folders
+            .with_patch_rx(patch_rx); // Live company-assignment updates
         tree.fetch_roots();
         Self {
             tree,
@@ -107,19 +137,11 @@ impl eframe::App for FileBrowserApp {
                     ui.add_space(4.0);
                 }
 
-                let unset = self.tree.unset_count();
-                if unset > 0 {
-                    ui.label(egui::RichText::new(format!(
-                        "! {unset} item(s) need a Copy or Sync policy"
-                    )).size(11.0).color(WARNING_COLOR));
-                    ui.add_space(4.0);
-                }
-
                 ui.horizontal(|ui| {
                     let count = self.tree.build_selections().len();
                     ui.label(egui::RichText::new(format!("{count} item(s) selected")).size(12.0).color(TEXT_SECONDARY));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let has_selections = count > 0 && unset == 0;
+                        let has_selections = count > 0;
                         let btn = egui::Button::new(
                             egui::RichText::new("Confirm & Start Sync").size(14.0).color(TEXT_PRIMARY),
                         )
@@ -164,6 +186,7 @@ impl eframe::App for FileBrowserApp {
             .resizable(true)
             .min_width(220.0)
             .default_width(400.0)
+            .show_separator_line(false)
             .frame(egui::Frame::default().fill(DARK_BG).inner_margin(egui::Margin::same(10.0)))
             .show(ctx, |ui| {
                 if let Some(file) = self.tree.render(ui) {
@@ -223,7 +246,6 @@ fn render_preview(ui: &mut egui::Ui, file: &Option<CloudFile>, sync_folder: &str
                 });
 
                 ui.add_space(14.0);
-                divider(ui);
                 ui.add_space(10.0);
 
                 // Metadata card
@@ -419,11 +441,12 @@ pub fn show_file_browser(auth: &AuthState, config: &mut AppConfig, rt: &Runtime)
     let selections = Arc::new(std::sync::Mutex::new(Vec::<FolderSelection>::new()));
     let selections_clone = selections.clone();
 
+    let config_clone = config.clone();
     let _ = eframe::run_native(
         "AGB Cloud Client - Select Folders",
         options,
         Box::new(move |_cc| {
-            let app = FileBrowserApp::new(auth_clone, handle, &sync_folder, &saved_folders);
+            let app = FileBrowserApp::new(auth_clone, handle, &sync_folder, &saved_folders, config_clone);
             Ok(Box::new(BrowserWrapper { inner: app, selections: selections_clone }))
         }),
     );

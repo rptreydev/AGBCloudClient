@@ -11,9 +11,10 @@ use eframe::egui;
 use tracing::{error, info};
 
 use crate::auth::AuthState;
-use crate::models::{FolderSelection, SyncPolicy};
+use crate::models::{CloudFile, FolderSelection};
 use crate::sync::remote::RemoteClient;
 use crate::ui::common::*;
+use crate::ws::events::{TreePatch, TreePatchAction};
 
 /// Self-contained folder-tree selection widget.
 pub struct FolderTreeWidget {
@@ -25,8 +26,10 @@ pub struct FolderTreeWidget {
     pub error: String,
 
     roots: Vec<TreeNode>,
-    selected_policies: HashMap<String, Option<SyncPolicy>>,
-    explicit_selections: HashSet<String>,
+    /// Map of UUID → bool:
+    ///   `true`  = explicitly selected by the user (full checkmark)
+    ///   `false` = ancestor marker only (dash — has a selected descendant)
+    selected: HashMap<String, bool>,
     /// Copy of the original saved selections passed to `with_initial_selections`.
     /// Used as a fallback in `build_selections()` for items whose tree nodes
     /// haven't been loaded yet (user hasn't expanded that branch).
@@ -42,6 +45,9 @@ pub struct FolderTreeWidget {
     /// the user wants to navigate freely without pre-selected folders expanding
     /// automatically and shifting the view.
     auto_expand: bool,
+    /// Optional receiver for real-time company-assignment delta updates.
+    /// Set via [`set_patch_rx`] from the Folder Manager subprocess.
+    patch_rx: Option<mpsc::Receiver<TreePatch>>,
 }
 
 impl FolderTreeWidget {
@@ -52,15 +58,22 @@ impl FolderTreeWidget {
             is_loading: false,
             error: String::new(),
             roots: Vec::new(),
-            selected_policies: HashMap::new(),
-            explicit_selections: HashSet::new(),
+            selected: HashMap::new(),
             initial_selections: Vec::new(),
             result_rx: None,
             auth,
             handle,
             pending_fetches: VecDeque::new(),
             auto_expand: true,
+            patch_rx: None,
         }
+    }
+
+    /// Attach a company-assignment patch receiver (builder-style).
+    /// Call from the Folder Manager subprocess after creating the WS channel.
+    pub fn with_patch_rx(mut self, rx: mpsc::Receiver<TreePatch>) -> Self {
+        self.patch_rx = Some(rx);
+        self
     }
 
     /// Disable auto-expansion of pre-selected folders (builder-style).
@@ -76,8 +89,7 @@ impl FolderTreeWidget {
     /// Pre-populate selections from a saved config (builder-style, call before `fetch_roots`).
     pub fn with_initial_selections(mut self, selections: &[FolderSelection]) -> Self {
         for f in selections {
-            self.selected_policies.insert(f.uuid.clone(), Some(f.policy.clone()));
-            self.explicit_selections.insert(f.uuid.clone());
+            self.selected.insert(f.uuid.clone(), true);
         }
         self.initial_selections = selections.to_vec();
         self
@@ -93,8 +105,13 @@ impl FolderTreeWidget {
         let (tx, rx) = mpsc::channel();
         self.result_rx = Some(rx);
         self.handle.spawn(async move {
+            // Route to the correct endpoint based on the user's role:
+            //   COMPANY_SUPERVISOR / SUPERVISOR → GET /cloud-file/folders
+            //     (backend filters to only their supervised companies/projects)
+            //   Everyone else → GET /cloud-file  (all roots, no filter)
+            let is_supervisor = auth.is_company_supervisor().await;
             let remote = RemoteClient::new(auth);
-            match remote.get_roots().await {
+            match remote.get_roots_filtered(is_supervisor).await {
                 Ok(roots) => { let _ = tx.send(FetchResult::Roots(roots)); }
                 Err(e)    => { let _ = tx.send(FetchResult::Error(e.to_string())); }
             }
@@ -158,16 +175,12 @@ impl FolderTreeWidget {
                     // child is an explicit selection, its ancestors (including parent_uuid)
                     // will now be findable and get ancestor markers.
                     self.rebuild_ancestor_markers();
-                    // Only propagate policy to newly-loaded children if the parent was
-                    // explicitly selected (has a real policy + is in explicit_selections).
-                    // Ancestor markers (None) must NOT trigger propagation — that was the
-                    // sibling-selection bug.
-                    if self.explicit_selections.contains(&parent_uuid) {
-                        if let Some(Some(policy)) = self.selected_policies.get(&parent_uuid) {
-                            let policy = policy.clone();
-                            for uuid in collect_descendant_uuids(&self.roots, &parent_uuid) {
-                                self.selected_policies.entry(uuid).or_insert(Some(policy.clone()));
-                            }
+                    // Propagate selection to newly-loaded children if the parent was
+                    // explicitly selected. Ancestor markers (false) must NOT trigger
+                    // propagation — that was the sibling-selection bug.
+                    if matches!(self.selected.get(&parent_uuid), Some(true)) {
+                        for uuid in collect_descendant_uuids(&self.roots, &parent_uuid) {
+                            self.selected.entry(uuid).or_insert(true);
                         }
                     }
                     // Continue auto-expanding deeper ancestor-marked nodes now that new
@@ -184,6 +197,20 @@ impl FolderTreeWidget {
             ctx.request_repaint();
         }
 
+        // ── Company-assignment delta patches ─────────────────────────────────
+        // Drain all pending patches from the WS channel and apply them without
+        // touching unrelated tree state or user selections.
+        // Collect first to release the borrow on `self.patch_rx` before calling
+        // `apply_tree_patch` which needs `&mut self`.
+        let patches: Vec<TreePatch> = self.patch_rx
+            .as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+        if !patches.is_empty() {
+            for patch in patches { self.apply_tree_patch(patch); }
+            ctx.request_repaint();
+        }
+
         // Drain auto-expand queue: kick off the next fetch when the previous one finished.
         // Set is_loading = true so the Empty branch keeps requesting repaints while the
         // fetch is in progress — without this, children appear only after mouse interaction.
@@ -197,42 +224,44 @@ impl FolderTreeWidget {
         }
     }
 
-    /// Scan the loaded tree and add `None` ancestor markers for every ancestor
-    /// of an explicit selection that is currently visible in the tree.
+    /// Scan the loaded tree and add `false` ancestor markers for every ancestor
+    /// of an explicit selection (`true`) that is currently visible in the tree.
     /// Called after each tree load so reopening settings shows correct checkmarks.
     fn rebuild_ancestor_markers(&mut self) {
         // Tree-based: mark ancestors of explicit selections already visible in the tree.
-        let uuids: Vec<String> = self.explicit_selections.iter().cloned().collect();
+        let uuids: Vec<String> = self.selected.iter()
+            .filter(|(_, v)| **v)
+            .map(|(k, _)| k.clone())
+            .collect();
         for uuid in &uuids {
             for ancestor in find_ancestor_uuids(&self.roots, uuid) {
-                if !self.explicit_selections.contains(&ancestor) {
-                    self.selected_policies.entry(ancestor).or_insert(None);
+                if !matches!(self.selected.get(&ancestor), Some(true)) {
+                    self.selected.entry(ancestor).or_insert(false);
                 }
             }
         }
 
         // Path-based (multi-level): walk every path component and mark ALL intermediate
         // ancestors visible at any depth in the loaded tree.
-        //
-        // The old code only marked the root-level ancestor ("ROOT" from "ROOT / A / B").
-        // After loading ROOT's children (revealing "A"), "A" never got a None marker,
-        // so enqueue_ancestor_marked_nodes() never queued "A" for fetch and "B" was
-        // never visible. This version walks deeper into each loaded level, allowing the
-        // auto-expand cascade to proceed one level at a time.
         let initial_selections = self.initial_selections.clone(); // owned copy avoids borrow conflict
         for sel in &initial_selections {
-            if !self.explicit_selections.contains(&sel.uuid) { continue; }
+            if !matches!(self.selected.get(&sel.uuid), Some(true)) { continue; }
             let components: Vec<&str> = sel.path.split(" / ").map(str::trim).collect();
             let mut to_mark: Vec<String> = Vec::new();
+            // Reuse explicit UUIDs set for the helper signature
+            let explicit_uuids: HashSet<String> = self.selected.iter()
+                .filter(|(_, v)| **v)
+                .map(|(k, _)| k.clone())
+                .collect();
             collect_path_ancestor_uuids(
                 &self.roots,
                 &components,
                 &sel.uuid,
-                &self.explicit_selections,
+                &explicit_uuids,
                 &mut to_mark,
             );
             for uuid in to_mark {
-                self.selected_policies.entry(uuid).or_insert(None);
+                self.selected.entry(uuid).or_insert(false);
             }
         }
     }
@@ -243,42 +272,28 @@ impl FolderTreeWidget {
         for action in actions {
             match action {
                 TreeAction::Select(uuid) => {
-                    self.explicit_selections.insert(uuid.clone());
-                    self.selected_policies.insert(uuid.clone(), Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
+                    self.selected.insert(uuid.clone(), true);
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
-                        self.explicit_selections.insert(d.clone());
-                        self.selected_policies.entry(d).or_insert(Some(SyncPolicy::KeepSynced { interval_secs: 30 }));
+                        self.selected.entry(d).or_insert(true);
                     }
-                    // Mark ancestors with None (marker only — prevents sibling propagation on child-load)
+                    // Mark ancestors as ancestor markers (false = not directly selected)
                     for a in find_ancestor_uuids(&self.roots, &uuid) {
-                        self.selected_policies.entry(a).or_insert(None);
+                        self.selected.entry(a).or_insert(false);
                     }
                 }
                 TreeAction::Deselect(uuid) => {
-                    self.selected_policies.remove(&uuid);
-                    self.explicit_selections.remove(&uuid);
+                    self.selected.remove(&uuid);
                     for d in collect_descendant_uuids(&self.roots, &uuid) {
-                        self.selected_policies.remove(&d);
-                        self.explicit_selections.remove(&d);
+                        self.selected.remove(&d);
                     }
                     // Clean up ancestor markers bottom-up when no selected descendants remain
                     let mut ancestors = find_ancestor_uuids(&self.roots, &uuid);
                     ancestors.reverse();
                     for a in ancestors {
-                        if !self.explicit_selections.contains(&a)
-                            && !has_selected_descendant(&self.roots, &a, &self.selected_policies)
+                        if !matches!(self.selected.get(&a), Some(true))
+                            && !has_selected_descendant(&self.roots, &a, &self.selected)
                         {
-                            self.selected_policies.remove(&a);
-                        }
-                    }
-                }
-                TreeAction::SetPolicy(uuid, policy) => {
-                    self.explicit_selections.insert(uuid.clone());
-                    self.selected_policies.insert(uuid.clone(), Some(policy.clone()));
-                    // Propagate to already-selected descendants only
-                    for d in collect_descendant_uuids(&self.roots, &uuid) {
-                        if self.selected_policies.contains_key(&d) {
-                            self.selected_policies.insert(d, Some(policy.clone()));
+                            self.selected.remove(&a);
                         }
                     }
                 }
@@ -334,8 +349,9 @@ impl FolderTreeWidget {
         egui::ScrollArea::vertical()
             .id_salt("agb_folder_tree_scroll")     // stable ID so scroll offset persists across repaints
             .drag_to_scroll(false)                 // prevent clicks on checkboxes from being misread as scroll drags
+            .auto_shrink([false, false])            // always expand to fill available height
             .show(ui, |ui| {
-                render_tree(ui, &mut self.roots, &self.selected_policies, 0, &mut actions, &search, &mut preview);
+                render_tree(ui, &mut self.roots, &self.selected, 0, &mut actions, &search, &mut preview);
             });
         self.process_actions(actions);
         preview
@@ -346,64 +362,39 @@ impl FolderTreeWidget {
     /// Total entries in the selection map (including ancestor markers).
     /// Use this for the "N item(s) selected" counter shown in the UI.
     pub fn map_len(&self) -> usize {
-        self.selected_policies.len()
+        self.selected.len()
     }
 
-    /// `true` if at least one folder has a real policy (not just an ancestor marker).
+    /// `true` if at least one folder is explicitly selected (not just an ancestor marker).
     pub fn has_real_selection(&self) -> bool {
-        self.selected_policies.values().any(|p| p.is_some())
-    }
-
-    /// Count of explicitly-selected items that still have no sync policy assigned.
-    ///
-    /// Ancestor markers (`None` in `selected_policies` but NOT in `explicit_selections`)
-    /// are intentionally excluded — they don't need a policy themselves; they just
-    /// indicate that a descendant is selected.
-    ///
-    /// By construction `TreeAction::Select` always assigns `KeepSynced`, so this
-    /// should normally return 0.  It would only be non-zero in an edge case where
-    /// an explicit selection somehow ended up without a concrete policy.
-    pub fn unset_count(&self) -> usize {
-        self.explicit_selections
-            .iter()
-            .filter(|uuid| !matches!(
-                self.selected_policies.get(*uuid),
-                Some(Some(_))
-            ))
-            .count()
+        self.selected.values().any(|v| *v)
     }
 
     /// Estimated total size of all selected items.
     pub fn selected_size(&self) -> u64 {
-        calc_selected_size(&self.roots, &self.selected_policies)
+        calc_selected_size(&self.roots, &self.selected)
     }
 
-    /// Build the final list of `FolderSelection` (only items with a real policy).
+    /// Build the final list of `FolderSelection` (only explicitly-selected items).
     ///
-    /// Also includes items from `initial_selections` that are still in
-    /// `explicit_selections` but whose tree nodes haven't been loaded yet
-    /// (user hasn't expanded that branch). This prevents losing selections
-    /// when the user opens Settings, makes no changes, and clicks Save.
+    /// Also includes items from `initial_selections` that are still selected
+    /// but whose tree nodes haven't been loaded yet (user hasn't expanded that
+    /// branch). This prevents losing selections when the user opens Settings,
+    /// makes no changes, and clicks Save.
     pub fn build_selections(&self) -> Vec<FolderSelection> {
         let mut out = Vec::new();
-        collect_selections(&self.roots, &self.selected_policies, &self.roots, &mut out);
+        collect_selections(&self.roots, &self.selected, &self.roots, &mut out);
 
         // Fallback: add initial selections not yet visible in the loaded tree.
-        // Collect owned Strings to avoid holding a borrow on `out`.
         let found: HashSet<String> = out.iter().map(|s| s.uuid.clone()).collect();
         for sel in &self.initial_selections {
             if found.contains(&sel.uuid) { continue; }
-            if !self.explicit_selections.contains(&sel.uuid) { continue; }
-            // Use current policy in case it was changed interactively.
-            if let Some(Some(policy)) = self.selected_policies.get(&sel.uuid) {
-                out.push(FolderSelection {
-                    uuid: sel.uuid.clone(),
-                    name: sel.name.clone(),
-                    path: sel.path.clone(),
-                    policy: policy.clone(),
-                    completed: sel.completed,
-                });
-            }
+            if !matches!(self.selected.get(&sel.uuid), Some(true)) { continue; }
+            out.push(FolderSelection {
+                uuid: sel.uuid.clone(),
+                name: sel.name.clone(),
+                path: sel.path.clone(),
+            });
         }
         out
     }
@@ -417,7 +408,7 @@ impl FolderTreeWidget {
     /// This makes pre-selected sub-folders visible when opening the Folder
     /// Manager without the user needing to manually click expand arrows.
     fn enqueue_ancestor_marked_nodes(&mut self) {
-        if self.explicit_selections.is_empty() {
+        if !self.selected.values().any(|v| *v) {
             return; // Nothing to expand — skip the scan
         }
 
@@ -427,7 +418,7 @@ impl FolderTreeWidget {
         let mut to_fetch: Vec<String> = Vec::new();
         find_ancestor_marked_for_expand(
             &self.roots,
-            &self.selected_policies,
+            &self.selected,
             &mut to_expand,
             &mut to_fetch,
         );
@@ -444,6 +435,68 @@ impl FolderTreeWidget {
             }
         }
     }
+
+    // ── Real-time company patch ───────────────────────────────────────────────
+
+    /// Apply a company-assignment delta without refreshing the whole tree.
+    ///
+    /// * `Added`   → prepend a new root node (folder) for the company.
+    /// * `Removed` → remove the root node and clean up any selections for it.
+    fn apply_tree_patch(&mut self, patch: TreePatch) {
+        match patch.action {
+            TreePatchAction::Added => {
+                // Avoid duplicates (event may fire twice on reconnect).
+                if self.roots.iter().any(|n| n.file.uuid == patch.company_uuid) {
+                    return;
+                }
+                let cf = CloudFile {
+                    id:           None,
+                    uuid:         patch.company_uuid.clone(),
+                    name:         patch.company_name.clone(),
+                    folder:       true,
+                    no_file:      None,
+                    size:         None,
+                    ext:          None,
+                    hash:         None,
+                    mime:         None,
+                    is_protected: None,
+                    password:     None,
+                    has_gps:      None,
+                    created:      None,
+                    updated:      None,
+                    deleted:      None,
+                    children:     Some(Vec::new()),
+                };
+                info!("FolderTree: company added — inserting root '{}'", patch.company_name);
+                self.roots.insert(0, TreeNode::from_cloud_file(cf));
+            }
+            TreePatchAction::Removed => {
+                let before = self.roots.len();
+                self.roots.retain(|n| n.file.uuid != patch.company_uuid);
+                if self.roots.len() < before {
+                    info!("FolderTree: company removed — dropping root '{}'", patch.company_name);
+                    // Clean up all selections that belonged to this company root.
+                    let to_remove: Vec<String> = self.selected.keys()
+                        .filter(|uuid| {
+                            // Remove the company uuid itself and any descendant that
+                            // matches (descendant uuids can't be recovered once node
+                            // is gone, so clear only exact uuid and initial_selections).
+                            **uuid == patch.company_uuid
+                        })
+                        .cloned()
+                        .collect();
+                    for uuid in to_remove {
+                        self.selected.remove(&uuid);
+                    }
+                    // Also remove initial_selections that belonged to this company.
+                    self.initial_selections.retain(|s| {
+                        !s.path.starts_with(&patch.company_name)
+                            && s.uuid != patch.company_uuid
+                    });
+                }
+            }
+        }
+    }
 }
 
 // ── Private free functions for auto-expand ───────────────────────────────────
@@ -455,14 +508,14 @@ impl FolderTreeWidget {
 /// * `to_fetch`  — UUIDs whose children should be fetched (not yet loaded)
 fn find_ancestor_marked_for_expand(
     nodes: &[TreeNode],
-    policies: &HashMap<String, Option<SyncPolicy>>,
+    policies: &HashMap<String, bool>,
     to_expand: &mut Vec<String>,
     to_fetch: &mut Vec<String>,
 ) {
     for node in nodes {
         if !node.file.folder { continue; }
 
-        let is_ancestor_marker = matches!(policies.get(&node.file.uuid), Some(None));
+        let is_ancestor_marker = matches!(policies.get(&node.file.uuid), Some(false));
 
         if is_ancestor_marker {
             to_expand.push(node.file.uuid.clone());

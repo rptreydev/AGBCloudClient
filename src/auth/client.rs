@@ -3,6 +3,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use anyhow::Result;
 use reqwest::Client;
+
+#[cfg(test)]
+#[path = "client_tests.rs"]
+mod client_tests;
 use tracing::{debug, info, warn};
 
 use crate::config::AppConfig;
@@ -29,7 +33,7 @@ impl AuthState {
         let client = Client::builder()
             .danger_accept_invalid_certs(true) // Dev self-signed certs
             .cookie_store(true)
-            .user_agent("AGB-Desktop Dart/0.1.0")
+            .user_agent("AGB-Desktop/0.1.0")
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .build()
@@ -87,6 +91,8 @@ impl AuthState {
                     let mut inner = self.inner.write().await;
                     inner.access_token = Some(token.clone());
                     inner.is_authenticated = true;
+                    // Rebuild minimal user (with role) from stored credentials.
+                    inner.user = Self::rebuild_user_from_store(&username);
                     if let Err(e) = CredentialStore::store_token(&username, &token) {
                         warn!("Failed to cache refreshed JWT (non-critical): {e}");
                     }
@@ -122,6 +128,9 @@ impl AuthState {
                 let mut inner = self.inner.write().await;
                 inner.access_token = Some(token);
                 inner.is_authenticated = true;
+                // Rebuild a minimal User with the stored role so role-based routing
+                // (e.g. COMPANY_SUPERVISOR → filtered folder endpoint) works after restart.
+                inner.user = Self::rebuild_user_from_store(username);
                 info!("Session restored from stored JWT for: {username}");
                 true
             }
@@ -130,6 +139,40 @@ impl AuthState {
                 false
             }
         }
+    }
+
+    /// Build a minimal `User` from credentials stored in the keychain.
+    /// Only the `username` and `role` fields are populated; everything else is `None`.
+    fn rebuild_user_from_store(username: &str) -> Option<crate::models::User> {
+        let role_str = CredentialStore::get_user_role(username).ok()??;
+        // Deserialize the SCREAMING_SNAKE_CASE role name from the stored string.
+        let role = serde_json::from_str::<crate::models::UserRole>(
+            &format!("\"{}\"", role_str)
+        ).ok()?;
+        Some(crate::models::User {
+            id: None,
+            username: username.to_string(),
+            email: None,
+            first_name: None,
+            last_name: None,
+            role: Some(role),
+            active: None,
+        })
+    }
+
+    /// Returns the username of the currently authenticated user, if any.
+    pub async fn current_username(&self) -> Option<String> {
+        self.inner.read().await.user.as_ref().map(|u| u.username.clone())
+    }
+
+    /// Returns `true` when the current session belongs to a `COMPANY_SUPERVISOR`
+    /// or `SUPERVISOR` user — used to select the appropriate folder fetch endpoint.
+    pub async fn is_company_supervisor(&self) -> bool {
+        use crate::models::UserRole;
+        matches!(
+            self.inner.read().await.user.as_ref().and_then(|u| u.role.as_ref()),
+            Some(UserRole::COMPANY_SUPERVISOR) | Some(UserRole::SUPERVISOR)
+        )
     }
 
     /// Auto-login using stored password (Path 3).
@@ -167,6 +210,19 @@ impl AuthState {
         refresh: Option<String>,
         user: Option<crate::models::User>,
     ) -> Result<()> {
+        // Store user role so it can be restored across process restarts.
+        if let Some(u) = &user {
+            if let Some(role) = &u.role {
+                // UserRole serializes to its SCREAMING_SNAKE_CASE name via serde.
+                if let Ok(role_json) = serde_json::to_string(role) {
+                    // Strip surrounding quotes from the JSON string value.
+                    let role_str = role_json.trim_matches('"');
+                    if let Err(e) = CredentialStore::store_user_role(username, role_str) {
+                        warn!("Failed to store user role (non-critical): {e}");
+                    }
+                }
+            }
+        }
         {
             let mut inner = self.inner.write().await;
             inner.access_token = Some(token.to_string());
@@ -236,13 +292,22 @@ impl AuthState {
             ));
         }
 
-        // Initial login request (may trigger 2FA or direct login)
-        let url = format!("{}/authentication/login", self.config.server_url);
+        // Initial login request — native endpoint, direct login (no 2FA)
+        let url = format!("{}/authentication/native/login", self.config.server_url);
         let resp = self.client
             .post(&url)
             .json(&body)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                if e.is_connect() {
+                    anyhow::anyhow!("Unable to connect to server. Check your connection.")
+                } else if e.is_timeout() {
+                    anyhow::anyhow!("Connection timed out. Try again.")
+                } else {
+                    anyhow::anyhow!("Network error. Please try again.")
+                }
+            })?;
 
         // Save status before the response body is consumed.
         let status = resp.status();
@@ -250,7 +315,7 @@ impl AuthState {
 
         let text = resp.text().await?;
         let response: LoginResponse = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("Invalid login response: {e}\n{text}"))?;
+            .map_err(|_| anyhow::anyhow!("Unexpected server response. Please try again."))?;
 
         // Direct login — server returned JWT cookie (e.g. Dart-like clients)
         if let Some(token) = jwt {
@@ -259,10 +324,17 @@ impl AuthState {
         }
 
         // HTTP error (wrong credentials, account locked, etc.) — surface the
-        // backend message directly so the UI can display it.
+        // backend message but never expose internal route paths.
         if !status.is_success() {
-            let msg = response.message
+            let raw = response.message
                 .unwrap_or_else(|| format!("Login failed ({})", status.as_u16()));
+            // Strip internal paths like "Cannot POST /api/v2/..." that the server
+            // may return on 404 — they reveal infrastructure and confuse users.
+            let msg = if raw.starts_with("Cannot ") || raw.contains("/api/") {
+                format!("Authentication service unavailable ({}). Try again later.", status.as_u16())
+            } else {
+                raw
+            };
             return Err(anyhow::anyhow!("{}", msg));
         }
 
