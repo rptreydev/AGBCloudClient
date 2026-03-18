@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use eframe::egui;
 use tracing::info;
 
-use crate::models::{CloudFile, FolderSelection, SyncPolicy};
+use crate::models::{CloudFile, FolderSelection};
 
 // ── Brand colors (Material Design 3 dark theme) ──
 
@@ -70,7 +70,6 @@ pub enum FetchResult {
 pub enum TreeAction {
     Select(String),
     Deselect(String),
-    SetPolicy(String, SyncPolicy),
     FetchChildren(String),
 }
 
@@ -232,7 +231,7 @@ pub fn custom_checkbox(ui: &mut egui::Ui, checked: &mut bool, intermediate: bool
 pub fn render_tree(
     ui: &mut egui::Ui,
     nodes: &mut [TreeNode],
-    selected: &HashMap<String, Option<SyncPolicy>>,
+    selected: &HashMap<String, bool>,
     depth: usize,
     actions: &mut Vec<TreeAction>,
     search: &str,
@@ -249,14 +248,13 @@ pub fn render_tree(
 
         let indent = depth as f32 * 22.0;
         let uuid = node.file.uuid.clone();
-        // contains_key is true for both explicit selections AND ancestor markers (None),
+        // contains_key is true for both explicit selections AND ancestor markers (false),
         // so the parent appears checked when any child is selected.
         let is_selected = selected.contains_key(&uuid);
-        // flatten() is None for ancestor markers — policy buttons are hidden for them,
-        // preventing accidental promotion of a marker to an explicit selection.
-        let policy = selected.get(&uuid).cloned().flatten();
-        // Ancestor marker: checked but no direct policy → show dash (not full checkmark)
-        let is_ancestor_marker = is_selected && policy.is_none();
+        // true = explicitly selected, false = ancestor marker only
+        let is_explicit = matches!(selected.get(&uuid), Some(true));
+        // Ancestor marker: checked but not directly selected → show dash
+        let is_ancestor_marker = is_selected && !is_explicit;
 
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -310,26 +308,6 @@ pub fn render_tree(
                 }
             }
 
-            // Policy buttons only for explicit selections (policy.is_some()).
-            if policy.is_some() {
-                ui.add_space(8.0);
-                let is_copy = matches!(&policy, Some(SyncPolicy::Copy));
-                let is_sync = matches!(&policy, Some(SyncPolicy::KeepSynced { .. }));
-
-                if ui.add(policy_button("Copy", is_copy))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    actions.push(TreeAction::SetPolicy(uuid.clone(), SyncPolicy::Copy));
-                }
-                if ui.add(policy_button("Sync", is_sync))
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .clicked()
-                {
-                    actions.push(TreeAction::SetPolicy(uuid.clone(), SyncPolicy::KeepSynced { interval_secs: 30 }));
-                }
-            }
-
             // Size
             if let Some(size) = node.file.size {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -342,19 +320,6 @@ pub fn render_tree(
             render_tree(ui, &mut node.children, selected, depth + 1, actions, search, preview);
         }
     }
-}
-
-pub fn policy_button(label: &str, active: bool) -> egui::Button<'_> {
-    let (fill, text_color, stroke_color) = if active {
-        (ACCENT, TEXT_PRIMARY, ACCENT)
-    } else {
-        (egui::Color32::TRANSPARENT, TEXT_SECONDARY, BTN_BORDER)
-    };
-    egui::Button::new(egui::RichText::new(label).size(10.0).color(text_color))
-        .fill(fill)
-        .stroke(egui::Stroke::new(1.0, stroke_color))
-        .rounding(10.0)
-        .min_size(egui::vec2(48.0, 22.0))
 }
 
 pub fn any_child_matches(nodes: &[TreeNode], search: &str) -> bool {
@@ -420,12 +385,12 @@ pub fn find_ancestor_uuids(roots: &[TreeNode], target: &str) -> Vec<String> {
     path
 }
 
-/// Check if any descendant of `parent_uuid` has a real policy (Some(Some(_))) in `selected`.
-/// Used to determine if an ancestor marker (None) should be kept or cleaned up.
+/// Check if any descendant of `parent_uuid` is explicitly selected (true) in `selected`.
+/// Used to determine if an ancestor marker (false) should be kept or cleaned up.
 pub fn has_selected_descendant(
     roots: &[TreeNode],
     parent_uuid: &str,
-    selected: &HashMap<String, Option<SyncPolicy>>,
+    selected: &HashMap<String, bool>,
 ) -> bool {
     fn find_node<'a>(nodes: &'a [TreeNode], uuid: &str) -> Option<&'a TreeNode> {
         for node in nodes {
@@ -434,9 +399,9 @@ pub fn has_selected_descendant(
         }
         None
     }
-    fn check(node: &TreeNode, selected: &HashMap<String, Option<SyncPolicy>>) -> bool {
+    fn check(node: &TreeNode, selected: &HashMap<String, bool>) -> bool {
         for child in &node.children {
-            if matches!(selected.get(&child.file.uuid), Some(Some(_))) { return true; }
+            if matches!(selected.get(&child.file.uuid), Some(true)) { return true; }
             if check(child, selected) { return true; }
         }
         false
@@ -446,10 +411,10 @@ pub fn has_selected_descendant(
 
 // ── Size / path helpers ──
 
-pub fn calc_selected_size(nodes: &[TreeNode], selected: &HashMap<String, Option<SyncPolicy>>) -> u64 {
+pub fn calc_selected_size(nodes: &[TreeNode], selected: &HashMap<String, bool>) -> u64 {
     let mut total = 0u64;
     for node in nodes {
-        if matches!(selected.get(&node.file.uuid), Some(Some(_))) {
+        if matches!(selected.get(&node.file.uuid), Some(true)) {
             total += node_total_size(node);
         } else {
             total += calc_selected_size(&node.children, selected);
@@ -482,7 +447,7 @@ pub fn build_path(roots: &[TreeNode], target_uuid: &str) -> String {
 
 pub fn collect_selections(
     nodes: &[TreeNode],
-    selected: &HashMap<String, Option<SyncPolicy>>,
+    selected: &HashMap<String, bool>,
     roots: &[TreeNode],
     out: &mut Vec<FolderSelection>,
 ) {
@@ -491,13 +456,11 @@ pub fn collect_selections(
         if !node.file.folder {
             continue;
         }
-        if let Some(Some(policy)) = selected.get(&node.file.uuid) {
+        if matches!(selected.get(&node.file.uuid), Some(true)) {
             out.push(FolderSelection {
                 uuid: node.file.uuid.clone(),
                 name: node.file.name.clone(),
                 path: build_path(roots, &node.file.uuid),
-                policy: policy.clone(),
-                completed: false,
             });
         }
         collect_selections(&node.children, selected, roots, out);
@@ -553,12 +516,6 @@ pub fn text_button(label: &str) -> egui::Button<'_> {
         .min_size(egui::vec2(70.0, 36.0))
         .rounding(18.0)
         .fill(egui::Color32::TRANSPARENT)
-}
-
-/// Material divider line.
-pub fn divider(ui: &mut egui::Ui) {
-    let rect = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
-    ui.painter().rect_filled(rect, 0.0, DIVIDER);
 }
 
 // ── Disk space ──
@@ -763,20 +720,73 @@ pub fn notify_shell_namespace_change() {
 
 /// Kill Explorer.exe and restart it so registry changes (e.g. namespace) take effect.
 ///
-/// Blocks until `Shell_TrayWnd` is visible (Explorer's taskbar fully loaded) or
-/// the 10-second timeout expires.  This prevents race conditions where the
-/// caller spawns a tray-icon process before the notification area exists —
-/// `Shell_NotifyIcon(NIM_ADD)` silently fails if Shell_TrayWnd is not yet running.
+/// Sequence:
+///  1. Force-kill explorer.exe
+///  2. Wait for Shell_TrayWnd to DISAPPEAR — ensures the old process is fully
+///     dead before we clear the cache and spawn a new Explorer.  Without this
+///     step, wait_for_shell_tray_wnd (step 4) can find the DYING Shell_TrayWnd
+///     and return too early.  run_tray() then calls Shell_NotifyIcon(NIM_ADD)
+///     when the notification area is not yet ready → NIM_ADD fails → HWND is
+///     leaked inside tray-icon.  That leaked HWND later receives WM_TASKBARCREATED
+///     and calls NIM_ADD itself, while the retry loop registers a SECOND icon → 2 icons.
+///  3. Clear TrayNotify cache (safe now that Explorer is dead)
+///  4. Spawn new Explorer, wait for Shell_TrayWnd to APPEAR
 pub fn restart_explorer() -> anyhow::Result<()> {
     no_window_cmd("taskkill")
         .args(["/f", "/im", "explorer.exe"])
         .output()?;
-    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Step 2: wait for the old Shell_TrayWnd to disappear (max 3 s).
+    wait_for_shell_tray_wnd_gone(3_000);
+
+    // Step 3: clear the notification-area icon cache AFTER Explorer is dead.
+    // Doing this while Explorer was still alive would have been a no-op (the
+    // registry write races with Explorer's in-memory state).
+    let tray_key = r"HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\TrayNotify";
+    for value in &["IconStreams", "PastIconsStream"] {
+        let _ = no_window_cmd("reg")
+            .args(["delete", tray_key, "/v", value, "/f"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    // Step 4: spawn Explorer and wait for its notification area to be ready.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     no_window_cmd("explorer.exe").spawn()?;
-    // Wait for Explorer's notification area to be ready before returning.
     wait_for_shell_tray_wnd(10_000);
     Ok(())
 }
+
+/// Poll until `Shell_TrayWnd` disappears (Explorer fully dead) or timeout.
+#[cfg(target_os = "windows")]
+fn wait_for_shell_tray_wnd_gone(timeout_ms: u64) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let class_wide: Vec<u16> = OsStr::new("Shell_TrayWnd")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(timeout_ms);
+
+    while std::time::Instant::now() < deadline {
+        let hwnd = unsafe {
+            winapi::um::winuser::FindWindowW(class_wide.as_ptr(), std::ptr::null())
+        };
+        if hwnd.is_null() {
+            info!("Explorer fully stopped (Shell_TrayWnd gone)");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    info!("wait_for_shell_tray_wnd_gone: timeout — proceeding anyway");
+}
+
+#[cfg(not(target_os = "windows"))]
+fn wait_for_shell_tray_wnd_gone(_timeout_ms: u64) {}
 
 /// Poll for `Shell_TrayWnd` (Explorer's system tray host window) with a timeout.
 /// Returns as soon as the window is found, or after `timeout_ms` milliseconds.
@@ -1000,6 +1010,30 @@ pub fn register_notification_app_id() {
 /// Must match the AUMID registered by [`register_notification_app_id`].
 pub const NOTIFICATION_APP_ID: &str = "AGBroadband.CloudClient";
 
+/// Show a Windows toast when a file is actually downloaded by the sync engine.
+/// Called only for files in selected folders — no false positives.
+pub fn show_download_notification(name: &str, mime: Option<&str>) {
+    let (icon, label) = match mime {
+        Some(m) if m.starts_with("image/") => ("📷", "New photo synced"),
+        Some(m) if m.starts_with("video/") => ("🎬", "New video synced"),
+        Some(m) if m.starts_with("audio/") => ("🎵", "New audio synced"),
+        Some("application/pdf")             => ("📄", "New PDF synced"),
+        Some(m) if m.contains("word") || m.contains("document") => ("📝", "New document synced"),
+        Some(m) if m.contains("sheet") || m.contains("excel")   => ("📊", "New spreadsheet synced"),
+        Some(m) if m.starts_with("text/") => ("📄", "New file synced"),
+        _                                  => ("📎", "New file synced"),
+    };
+    if let Err(e) = notify_rust::Notification::new()
+        .app_id(NOTIFICATION_APP_ID)
+        .summary(&format!("{icon} {label}"))
+        .body(name)
+        .timeout(notify_rust::Timeout::Milliseconds(5000))
+        .show()
+    {
+        tracing::debug!("Download notification failed: {e}");
+    }
+}
+
 // ── Drive enumeration ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1015,7 +1049,6 @@ pub struct DriveInfo {
     pub letter: String,      // "C:", "D:", "Z:"
     pub label: String,       // Volume label or "" if empty
     pub kind: DriveKind,
-    #[allow(dead_code)]
     pub total_bytes: u64,
     pub free_bytes: u64,
     pub available: bool,     // false if GetDiskFreeSpaceExW fails
@@ -1104,96 +1137,259 @@ pub fn enumerate_drives() -> Vec<DriveInfo> {
     vec![]
 }
 
-/// Render a horizontal row of drive-selection cards.
+/// Render a horizontal row of 3-D drive-selection cards.
 /// Returns `Some(path)` (e.g. `"D:\\CloudFiles"`) when the user clicks a drive,
 /// `None` if no click occurred or if no drives are found.
 pub fn render_drive_picker(ui: &mut egui::Ui, current_path: &str) -> Option<String> {
     let drives = enumerate_drives();
-    if drives.is_empty() {
-        return None;
-    }
+    if drives.is_empty() { return None; }
     let current_letter = drive_letter(current_path);
     let mut selected = None;
 
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
-        for d in &drives {
-            let is_cur = d.letter == current_letter;
-            let card_fill   = if is_cur { ACCENT_DIM }      else { SURFACE_VARIANT };
-            let card_stroke = if is_cur { ACCENT }           else { DIVIDER };
-            let free_gb     = d.free_bytes as f64 / 1_073_741_824.0;
+    // Card inner width; egui Frame manages height automatically from content
+    const CARD_W: f32 = 88.0;
+    const R: f32 = 10.0;
 
-            // Drive display name
-            let name_line = if d.label.is_empty() {
-                d.letter.clone()
-            } else if d.label.len() > 10 {
-                // Truncate long labels
-                format!("{}\n{}…", d.letter, &d.label[..9])
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+        for d in &drives {
+            let is_cur    = d.letter == current_letter;
+            let clickable = d.available && !is_cur;
+
+            // ── Per-drive accent colour ──────────────────────────────────
+            let accent = if is_cur {
+                ACCENT
             } else {
-                format!("{}\n{}", d.letter, d.label)
+                match d.kind {
+                    DriveKind::Fixed     => egui::Color32::from_rgb(110, 145, 210),
+                    DriveKind::Removable => WARNING_COLOR,
+                    DriveKind::Network   => ACCENT_DIM,
+                    DriveKind::Unknown   => TEXT_SECONDARY,
+                }
             };
 
-            let r = egui::Frame::default()
-                .fill(card_fill)
-                .stroke(egui::Stroke::new(1.5, card_stroke))
-                .rounding(8.0)
-                .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 8.0, bottom: 8.0 })
+            // Pre-compute text (before closure borrows `d`)
+            let vol_label: String = if d.label.is_empty() {
+                d.kind_label().to_string()
+            } else {
+                let s: String = d.label.chars().take(10).collect();
+                if d.label.len() > 10 { format!("{s}…") } else { s }
+            };
+            let (space_txt, space_col) = if d.available {
+                let free_gb = d.free_bytes as f64 / 1_073_741_824.0;
+                let t = if free_gb >= 1.0 {
+                    format!("{:.0} GB free", free_gb)
+                } else {
+                    format!("{:.0} MB free", d.free_bytes as f64 / 1_048_576.0)
+                };
+                (t, SUCCESS_COLOR)
+            } else {
+                ("Unavailable".to_string(), ERROR_COLOR)
+            };
+
+            // ── Card colours ─────────────────────────────────────────────
+            let base_fill = if is_cur {
+                egui::Color32::from_rgb(0, 50, 65)
+            } else {
+                egui::Color32::from_rgb(18, 26, 42)
+            };
+            let border = egui::Stroke::new(
+                if is_cur { 1.5 } else { 1.0 },
+                if is_cur { ACCENT } else { egui::Color32::from_rgb(36, 48, 70) },
+            );
+
+            // ── egui::Frame card (proper layout → no scroll issues) ──────
+            let resp = egui::Frame::default()
+                .fill(base_fill)
+                .stroke(border)
+                .rounding(R)
+                .inner_margin(egui::Margin { left: 8.0, right: 8.0, top: 8.0, bottom: 8.0 })
                 .show(ui, |ui| {
-                    ui.set_width(86.0);
+                    ui.set_width(CARD_W);
                     ui.vertical_centered(|ui| {
-                        // Kind badge instead of emoji
-                        let kind_color = match d.kind {
-                            DriveKind::Network   => ACCENT,
-                            DriveKind::Removable => WARNING_COLOR,
-                            _                    => TEXT_SECONDARY,
-                        };
-                        ui.label(
-                            egui::RichText::new(d.kind_label())
-                                .size(9.0)
-                                .color(kind_color),
+                        // Drive-type icon (painter-drawn vector)
+                        let (icon_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(20.0, 20.0), egui::Sense::hover(),
                         );
-                        ui.label(
-                            egui::RichText::new(&name_line)
-                                .size(12.0)
-                                .color(TEXT_PRIMARY)
-                                .strong(),
+                        draw_drive_icon(ui.painter(), icon_rect.center(), &d.kind, accent);
+
+                        ui.add_space(3.0);
+
+                        // Drive letter — bold RichText for crisp rendering
+                        let letter_col = if is_cur { ACCENT } else { TEXT_PRIMARY };
+                        ui.label(egui::RichText::new(&d.letter)
+                            .size(18.0).color(letter_col).strong());
+
+                        // Volume label / drive kind
+                        ui.label(egui::RichText::new(&vol_label)
+                            .size(10.0).color(TEXT_SECONDARY));
+
+                        ui.add_space(4.0);
+
+                        // Storage bar (painter-drawn, same style as before)
+                        let bar_h = 3.5;
+                        let (bar_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(CARD_W, bar_h), egui::Sense::hover(),
                         );
-                        if d.available {
-                            ui.label(
-                                egui::RichText::new(format!("{:.0} GB free", free_gb))
-                                    .size(10.0)
-                                    .color(TEXT_SECONDARY),
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new("Unavailable")
-                                    .size(10.0)
-                                    .color(ERROR_COLOR),
+                        let p = ui.painter();
+                        p.rect_filled(bar_rect, 2.0, egui::Color32::from_rgb(28, 38, 58));
+                        if d.available && d.total_bytes > 0 {
+                            let used_r = d.total_bytes.saturating_sub(d.free_bytes) as f32
+                                / d.total_bytes as f32;
+                            let uw = (CARD_W * used_r).min(CARD_W);
+                            p.rect_filled(
+                                egui::Rect::from_min_size(bar_rect.min, egui::vec2(uw, bar_h)),
+                                2.0,
+                                accent.gamma_multiply(if is_cur { 0.9 } else { 0.6 }),
                             );
                         }
+
+                        ui.add_space(2.0);
+
+                        // Free space text — RichText for clean rendering
+                        ui.label(egui::RichText::new(&space_txt)
+                            .size(9.5).color(space_col));
                     });
                 });
 
-            // Use ui.interact() with a stable, drive-letter-keyed ID so that press and
-            // release events on the same card are correctly associated across frames.
-            // r.response.interact(Sense::click()) uses an auto-generated Frame ID that
-            // is not guaranteed stable, causing missed or spurious click detections.
-            let card_resp = ui.interact(
-                r.response.rect,
-                ui.id().with((&d.letter, "drive_card")),
-                egui::Sense::click(),
+            let card_rect = resp.response.rect;
+            let painter   = ui.painter();
+
+            // ── 3-D overlay effects drawn over the Frame ─────────────────
+            // IMPORTANT: use from_rgba_unmultiplied for white tints.
+            // from_rgba_premultiplied(255,255,255,N) with N<255 renders nearly
+            // opaque white in egui's premultiplied pipeline (RGB=1.0 is added).
+
+            // Top face highlight (subtle)
+            let hi_alpha: u8 = if is_cur { 18 } else { 10 };
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    card_rect.min,
+                    egui::vec2(card_rect.width(), card_rect.height() * 0.45),
+                ),
+                egui::Rounding { nw: R, ne: R, sw: 0.0, se: 0.0 },
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, hi_alpha),
             );
-            if card_resp
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .clicked()
-                && d.available
-                && !is_cur
-            {
+
+            // Bottom depth shadow
+            let sh = card_rect.height() * 0.25;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(card_rect.min.x, card_rect.max.y - sh),
+                    egui::vec2(card_rect.width(), sh),
+                ),
+                egui::Rounding { nw: 0.0, ne: 0.0, sw: R, se: R },
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 40),
+            );
+
+            // Top bevel line (bright raised edge)
+            let bevel_a: u8 = if is_cur { 130 } else { 55 };
+            painter.line_segment(
+                [
+                    egui::pos2(card_rect.min.x + R - 1.0, card_rect.min.y + 0.75),
+                    egui::pos2(card_rect.max.x - R + 1.0, card_rect.min.y + 0.75),
+                ],
+                egui::Stroke::new(1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, bevel_a)),
+            );
+
+            // Selected inner glow
+            if is_cur {
+                painter.rect_stroke(
+                    card_rect.shrink(2.5),
+                    R - 2.0,
+                    egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.28)),
+                );
+            }
+
+            // Hover tint + updated border
+            let hovered = resp.response.hovered() && clickable;
+            if hovered {
+                painter.rect_filled(card_rect, R,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12));
+                painter.rect_stroke(card_rect, R,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 85, 120)));
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+
+            // ── Click interaction ────────────────────────────────────────
+            if resp.response.interact(egui::Sense::click()).clicked() && clickable {
                 selected = Some(format!("{}\\CloudFiles", d.letter));
             }
         }
     });
     selected
+}
+
+/// Draw a vector drive-type icon centred on `center` using the painter.
+fn draw_drive_icon(painter: &egui::Painter, center: egui::Pos2, kind: &DriveKind, col: egui::Color32) {
+    let dim = col.gamma_multiply(0.35);
+    let stroke = egui::Stroke::new(1.5, col);
+    match kind {
+        DriveKind::Fixed => {
+            // HDD: outer ring + inner ring + centre dot + read-arm line
+            painter.circle_stroke(center, 8.5, stroke);
+            painter.circle_stroke(center, 4.0, egui::Stroke::new(1.0, dim));
+            painter.circle_filled(center, 1.8, col);
+            // Read arm
+            painter.line_segment(
+                [egui::pos2(center.x + 1.0, center.y - 8.5),
+                 egui::pos2(center.x + 6.5, center.y - 2.0)],
+                egui::Stroke::new(1.5, col),
+            );
+        }
+        DriveKind::Removable => {
+            // USB key: rounded body + connector tab + two contact prongs
+            let body = egui::Rect::from_center_size(
+                egui::pos2(center.x, center.y + 1.5), egui::vec2(11.0, 13.0),
+            );
+            painter.rect_filled(body, 2.0, dim);
+            painter.rect_stroke(body, 2.0, stroke);
+            let tab = egui::Rect::from_center_size(
+                egui::pos2(center.x, center.y - 8.0), egui::vec2(8.0, 4.5),
+            );
+            painter.rect_filled(tab, 1.0, dim);
+            painter.rect_stroke(tab, 1.0, egui::Stroke::new(1.0, col));
+            // Prongs
+            for dx in [-2.5_f32, 2.5] {
+                painter.line_segment(
+                    [egui::pos2(center.x + dx, center.y - 1.0),
+                     egui::pos2(center.x + dx, center.y + 3.5)],
+                    egui::Stroke::new(1.0, col.gamma_multiply(0.7)),
+                );
+            }
+        }
+        DriveKind::Network => {
+            // Server stack: three rounded bars with LED dot
+            for i in 0i32..3 {
+                let y = center.y - 5.5 + i as f32 * 5.5;
+                let bar = egui::Rect::from_center_size(
+                    egui::pos2(center.x, y), egui::vec2(17.0, 3.5),
+                );
+                let alpha = if i == 0 { 0.45 } else if i == 1 { 0.28 } else { 0.18 };
+                painter.rect_filled(bar, 1.5, col.gamma_multiply(alpha));
+                painter.rect_stroke(bar, 1.5, egui::Stroke::new(1.0, col));
+                // LED
+                painter.circle_filled(
+                    egui::pos2(bar.max.x - 3.5, bar.center().y), 1.0, col,
+                );
+            }
+        }
+        DriveKind::Unknown => {
+            // Diamond outline
+            let s = 7.0;
+            let pts = [
+                egui::pos2(center.x,       center.y - s),
+                egui::pos2(center.x + s,   center.y),
+                egui::pos2(center.x,       center.y + s),
+                egui::pos2(center.x - s,   center.y),
+            ];
+            for i in 0..4 {
+                painter.line_segment([pts[i], pts[(i + 1) % 4]], stroke);
+            }
+        }
+    }
 }
 
 /// Enable or disable auto-start with Windows via the Run registry key.

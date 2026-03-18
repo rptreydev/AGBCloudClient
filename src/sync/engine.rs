@@ -2,15 +2,13 @@ use anyhow::Result;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Notify;
-use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::AuthState;
 use crate::config::AppConfig;
-use crate::models::{CloudFile, FolderSelection, SyncPolicy};
+use crate::models::{CloudFile, FolderSelection};
 use crate::sync::progress::{write_progress_file, SharedProgress, SyncPhase};
 use crate::sync::remote::RemoteClient;
-use crate::ui::common::NOTIFICATION_APP_ID;
 
 /// Orchestrates sync between local filesystem and remote API.
 pub struct SyncEngine {
@@ -24,88 +22,56 @@ impl SyncEngine {
         Self { remote, progress }
     }
 
-    /// Main sync loop — runs forever, reloading config from disk each cycle.
-    /// `sync_trigger` is a `Notify` that can interrupt the sleep between cycles
-    /// so a newly-saved folder selection syncs immediately (no full interval wait).
+    /// Main sync loop — runs forever, driven purely by WS events.
+    /// On startup it performs one initial sync, then blocks on `sync_trigger`
+    /// (notified by the WS client on every CLOUDFILE.* event).
+    /// The fixed-interval timer has been removed: sync only runs when the
+    /// server signals a change, keeping resource usage minimal.
     pub async fn run(&self, sync_trigger: Arc<Notify>) {
-        info!("Sync engine started");
+        info!("Sync engine started (event-driven mode — no interval timer)");
+
+        // Initial sync on startup so local state matches server from the start.
+        self.run_cycle().await;
+
         loop {
-            let config = match AppConfig::load_or_create() {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to reload config: {e}, sleeping 30s");
-                    sleep(Duration::from_secs(30)).await;
-                    continue;
-                }
-            };
-
-            // Check if sync is paused
-            let paused = self.progress.lock().map(|p| p.paused).unwrap_or(false);
-            if paused {
-                debug!("Sync paused, skipping cycle");
-                sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-
-            // Reset download counters for this cycle
-            self.update_progress(|p| {
-                p.files_downloaded = 0;
-                p.files_copied = 0;
-                p.files_synced = 0;
-                p.files_failed = 0;
-                p.last_error = None;
-            });
-
-            if let Err(e) = self.sync_all(&config).await {
-                error!("Sync cycle error: {e}");
-                self.set_phase(SyncPhase::Error(e.to_string()));
-            }
-
-            // Show notification with breakdown if any files were downloaded
-            let (copied, synced) = self.progress.lock()
-                .map(|p| (p.files_copied, p.files_synced))
-                .unwrap_or((0, 0));
-            if (copied > 0 || synced > 0) && config.notifications_enabled {
-                Self::show_sync_notification(copied, synced);
-            }
-
-            self.set_phase(SyncPhase::Idle);
-            // Interruptible sleep: wakes up early when Manage Folders saves new selections.
-            tokio::select! {
-                _ = sleep(Duration::from_secs(config.sync_interval_secs)) => {}
-                _ = sync_trigger.notified() => {
-                    info!("Sync triggered early — new folder selections detected");
-                }
-            }
+            // Block until the WS client fires notify_one().
+            sync_trigger.notified().await;
+            info!("Sync triggered by WS event");
+            self.run_cycle().await;
         }
     }
 
-    fn show_sync_notification(copied: usize, synced: usize) {
-        let mut lines = Vec::new();
-        if copied > 0 {
-            lines.push(format!(
-                "{} file{} copied to your device",
-                copied,
-                if copied == 1 { "" } else { "s" }
-            ));
+    /// Run a single sync cycle: reload config, check pause, sync, set Idle.
+    async fn run_cycle(&self) {
+        let config = match AppConfig::load_or_create() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to reload config: {e} — skipping cycle");
+                return;
+            }
+        };
+
+        // Check if sync is paused — consume the notification but do nothing.
+        let paused = self.progress.lock().map(|p| p.paused).unwrap_or(false);
+        if paused {
+            debug!("Sync paused — skipping cycle");
+            return;
         }
-        if synced > 0 {
-            lines.push(format!(
-                "{} file{} kept up to date",
-                synced,
-                if synced == 1 { "" } else { "s" }
-            ));
+
+        // Reset download counters for this cycle.
+        self.update_progress(|p| {
+            p.files_downloaded = 0;
+            p.files_synced = 0;
+            p.files_failed = 0;
+            p.last_error = None;
+        });
+
+        if let Err(e) = self.sync_all(&config).await {
+            error!("Sync cycle error: {e}");
+            self.set_phase(SyncPhase::Error(e.to_string()));
         }
-        let body = lines.join("\n");
-        if let Err(e) = notify_rust::Notification::new()
-            .app_id(NOTIFICATION_APP_ID)
-            .summary("Cloud Files — Sync Complete")
-            .body(&body)
-            .timeout(notify_rust::Timeout::Milliseconds(6000))
-            .show()
-        {
-            debug!("Notification failed: {e}");
-        }
+
+        self.set_phase(SyncPhase::Idle);
     }
 
     async fn sync_all(&self, config: &AppConfig) -> Result<()> {
@@ -134,15 +100,7 @@ impl SyncEngine {
         let selections = filter_root_selections(&config.selected_folders);
         info!("Syncing {} root selection(s)", selections.len());
 
-        let mut completed_uuids: Vec<String> = Vec::new();
-
         for sel in &selections {
-            // Skip completed one-time copies
-            if sel.policy == SyncPolicy::Copy && sel.completed {
-                debug!("Skipping completed copy: {}", sel.name);
-                continue;
-            }
-
             self.update_progress(|p| {
                 p.phase = SyncPhase::Syncing;
                 p.current_folder = sel.name.clone();
@@ -174,19 +132,7 @@ impl SyncEngine {
                     let delta = self.progress.lock()
                         .map(|p| p.files_downloaded.saturating_sub(before))
                         .unwrap_or(0);
-                    match sel.policy {
-                        SyncPolicy::Copy => {
-                            self.update_progress(|p| p.files_copied += delta);
-                            // Only mark as completed if files were actually downloaded.
-                            // If delta == 0 (e.g. download failed or timed out), retry next cycle.
-                            if delta > 0 {
-                                completed_uuids.push(sel.uuid.clone());
-                            }
-                        }
-                        SyncPolicy::KeepSynced { .. } => {
-                            self.update_progress(|p| p.files_synced += delta);
-                        }
-                    }
+                    self.update_progress(|p| p.files_synced += delta);
                 }
                 Err(e) => {
                     error!("Failed to sync {}: {e}", sel.name);
@@ -194,28 +140,6 @@ impl SyncEngine {
             }
         }
 
-        // Mark completed Copy folders and persist to config.
-        // IMPORTANT: reload a fresh copy from disk before saving so we don't overwrite
-        // any settings changes (sync_folder, selected_folders, etc.) that the user may
-        // have made via Settings or Manage Folders while this sync cycle was running.
-        if !completed_uuids.is_empty() {
-            match crate::config::AppConfig::load_or_create() {
-                Ok(mut fresh_config) => {
-                    for folder in &mut fresh_config.selected_folders {
-                        if completed_uuids.contains(&folder.uuid) {
-                            folder.completed = true;
-                            info!("Marked copy as completed: {}", folder.name);
-                        }
-                    }
-                    if let Err(e) = fresh_config.save() {
-                        error!("Failed to save config after marking copies complete: {e}");
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to reload config for marking copies complete: {e}");
-                }
-            }
-        }
 
         let done = self.progress.lock().map(|p| p.files_done).unwrap_or(0);
         info!("Sync cycle complete ({done} files processed)");
@@ -317,6 +241,9 @@ impl SyncEngine {
         info!("Downloading: {} -> {}", file.name, dest.display());
         let dest_str = dest.to_string_lossy().to_string();
         self.remote.download_file(&file.uuid, &dest_str).await?;
+
+        // Notify only after a real download from a selected folder.
+        crate::ui::common::show_download_notification(&file.name, file.mime.as_deref());
 
         self.update_progress(|p| {
             p.files_done += 1;

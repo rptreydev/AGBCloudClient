@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::auth::AuthState;
-use crate::models::cloud_file::{FolderSelection, SyncPolicy};
+use crate::models::cloud_file::FolderSelection;
 use crate::models::user::UserRole;
 use crate::sync::progress::{read_progress_file, SyncPhase, SyncProgress};
 use crate::ui::common::{
@@ -124,8 +124,20 @@ struct StatusPanel {
     nav_stack: Vec<std::path::PathBuf>,
     /// File browser: cached entries of the current directory
     dir_entries: Vec<DirEntry>,
-    /// Thumbnail cache: path → loaded texture (None = failed to load)
+    /// Thumbnail cache: path → loaded texture (None = failed / not yet ready)
     thumbnail_cache: std::collections::HashMap<std::path::PathBuf, Option<egui::TextureHandle>>,
+    /// Async thumbnail decoding: background thread sends (path, ColorImage)
+    thumbnail_rx: Vec<std::sync::mpsc::Receiver<(std::path::PathBuf, Option<egui::ColorImage>)>>,
+    /// Paths whose thumbnail decode has been dispatched (avoids duplicate spawns)
+    thumbnail_loading: std::collections::HashSet<std::path::PathBuf>,
+    /// Async directory load in progress
+    load_rx: Option<std::sync::mpsc::Receiver<Vec<DirEntry>>>,
+    /// True between the moment nav is applied and entries arrive — ensures spinner is shown
+    is_loading: bool,
+    /// Search/filter query for the file browser
+    search_query: String,
+    /// Previous sync phase — used to detect Syncing → Idle transitions
+    prev_phase: SyncPhase,
     done: bool,
 }
 
@@ -153,6 +165,12 @@ impl StatusPanel {
             nav_stack: Vec::new(),
             dir_entries: Vec::new(),
             thumbnail_cache: std::collections::HashMap::new(),
+            thumbnail_rx: Vec::new(),
+            thumbnail_loading: std::collections::HashSet::new(),
+            load_rx: None,
+            is_loading: false,
+            search_query: String::new(),
+            prev_phase: SyncPhase::Idle,
             done: false,
         }
     }
@@ -179,6 +197,77 @@ impl eframe::App for StatusPanel {
             self.sync_folder = sf;
             self.config_last_poll = std::time::Instant::now();
         }
+        // Auto-refresh file browser when a sync cycle finishes (Syncing → Idle/Error).
+        // The sync cycle is triggered by the WS event, so this fires shortly after
+        // a new file arrives — no need for a polling interval.
+        {
+            let prev_was_syncing = matches!(self.prev_phase, SyncPhase::Syncing);
+            let curr_is_syncing  = matches!(self.progress.phase, SyncPhase::Syncing);
+            let just_finished    = prev_was_syncing && !curr_is_syncing;
+            self.prev_phase = self.progress.phase.clone();
+
+            if just_finished
+                && self.active_tab == BrowserTab::Files
+                && !self.nav_stack.is_empty()
+                && self.load_rx.is_none()
+                && !self.is_loading
+            {
+                let sync_root = std::path::PathBuf::from(&self.sync_folder);
+                if let Some(current) = self.nav_stack.last().cloned() {
+                    // Silent background refresh: keep thumbnail cache (same directory,
+                    // existing textures remain valid) and do NOT set is_loading=true
+                    // so no spinner appears — entries update silently behind the scenes.
+                    self.load_rx = Some(start_load(current, sync_root));
+                }
+            }
+        }
+        // Drain async dir-load result
+        if let Some(rx) = &self.load_rx {
+            match rx.try_recv() {
+                Ok(entries) => {
+                    self.dir_entries = entries;
+                    self.load_rx = None;
+                    self.is_loading = false;
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.load_rx = None;
+                    self.is_loading = false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(30));
+                }
+            }
+        }
+
+        // Drain async thumbnail results — upload ColorImage → TextureHandle on main thread
+        {
+            let mut pending = Vec::new();
+            for rx in self.thumbnail_rx.drain(..) {
+                match rx.try_recv() {
+                    Ok((path, Some(img))) => {
+                        self.thumbnail_loading.remove(&path);
+                        let key = path.to_string_lossy().to_string();
+                        let tex = ctx.load_texture(key, img, egui::TextureOptions::LINEAR);
+                        self.thumbnail_cache.insert(path, Some(tex));
+                        ctx.request_repaint();
+                    }
+                    Ok((path, None)) => {
+                        self.thumbnail_loading.remove(&path);
+                        self.thumbnail_cache.insert(path, None);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        pending.push(rx);
+                    }
+                }
+            }
+            self.thumbnail_rx = pending;
+        }
+        if !self.thumbnail_rx.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
         // Keep refreshing while syncing so the progress bar animates
         let repaint_ms = if self.progress.phase == SyncPhase::Syncing { 250 } else { 1000 };
         ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
@@ -298,7 +387,9 @@ impl eframe::App for StatusPanel {
                             // Switch to Files: ensure nav_stack is initialized at sync root
                             if tab == BrowserTab::Files && self.nav_stack.is_empty() && !self.sync_folder.is_empty() {
                                 let root = std::path::PathBuf::from(&self.sync_folder);
-                                self.dir_entries = load_dir_entries(&root, &root);
+                                self.dir_entries.clear();
+                                self.search_query.clear();
+                                self.load_rx = Some(start_load(root.clone(), root.clone()));
                                 self.nav_stack.push(root);
                             }
                         }
@@ -445,7 +536,9 @@ impl eframe::App for StatusPanel {
                         // Ensure nav_stack has at least the sync root
                         if self.nav_stack.is_empty() && !self.sync_folder.is_empty() {
                             let root = std::path::PathBuf::from(&self.sync_folder);
-                            self.dir_entries = load_dir_entries(&root, &root);
+                            self.dir_entries.clear();
+                            self.search_query.clear();
+                            self.load_rx = Some(start_load(root.clone(), root.clone()));
                             self.nav_stack.push(root);
                         }
                         if self.render_browser_header(ui) {
@@ -453,15 +546,48 @@ impl eframe::App for StatusPanel {
                         }
                         let r = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
                         ui.painter().rect_filled(r, 0.0, DIVIDER);
-                        egui::ScrollArea::vertical()
-                            .id_salt("sp_browser_scroll")
-                            .auto_shrink([false, false])
+
+                        // ── Search bar ────────────────────────────────────────
+                        egui::Frame::default()
+                            .fill(SURFACE)
+                            .inner_margin(egui::Margin { left: 10.0, right: 10.0, top: 6.0, bottom: 6.0 })
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                if let Some(path) = self.render_browser_entries(ui) {
-                                    nav_push = Some(path);
-                                }
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search_query)
+                                        .hint_text("🔍  Filter files…")
+                                        .id(egui::Id::new("sp_search"))
+                                        .desired_width(f32::INFINITY)
+                                        .font(egui::FontId::proportional(12.5)),
+                                );
                             });
+                        let r2 = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
+                        ui.painter().rect_filled(r2, 0.0, DIVIDER);
+
+                        // ── Loading / entries ─────────────────────────────────
+                        if self.load_rx.is_some() || self.is_loading {
+                            ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Progress);
+                            egui::Frame::default()
+                                .inner_margin(egui::Margin { left: 14.0, right: 14.0, top: 40.0, bottom: 40.0 })
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.vertical_centered(|ui| {
+                                        ui.spinner();
+                                        ui.add_space(8.0);
+                                        ui.label(egui::RichText::new("Cargando…").size(12.0).color(TEXT_SECONDARY));
+                                    });
+                                });
+                        } else {
+                            egui::ScrollArea::vertical()
+                                .id_salt("sp_browser_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    if let Some(path) = self.render_browser_entries(ui) {
+                                        nav_push = Some(path);
+                                    }
+                                });
+                        }
                     }
                 }
             });
@@ -472,15 +598,27 @@ impl eframe::App for StatusPanel {
             // Don't pop past the sync root
             if self.nav_stack.len() > 1 {
                 self.thumbnail_cache.clear();
+                self.thumbnail_rx.clear();
+                self.thumbnail_loading.clear();
                 self.nav_stack.pop();
+                self.dir_entries.clear();
+                self.search_query.clear();
                 if let Some(p) = self.nav_stack.last().cloned() {
-                    self.dir_entries = load_dir_entries(&p, &sync_root);
+                    self.is_loading = true;
+                    self.load_rx = Some(start_load(p, sync_root));
+                    ctx.request_repaint(); // show spinner on very next frame
                 }
             }
         } else if let Some(path) = nav_push {
             self.thumbnail_cache.clear();
-            self.dir_entries = load_dir_entries(&path, &sync_root);
+            self.thumbnail_rx.clear();
+            self.thumbnail_loading.clear();
+            self.dir_entries.clear();
+            self.search_query.clear();
+            self.is_loading = true;
+            self.load_rx = Some(start_load(path.clone(), sync_root));
             self.nav_stack.push(path);
+            ctx.request_repaint(); // show spinner on very next frame
         }
     }
 }
@@ -567,7 +705,7 @@ impl StatusPanel {
             );
         });
 
-        if p.files_copied > 0 || p.files_synced > 0 {
+        if p.files_synced > 0 {
             ui.add_space(14.0);
             egui::Frame::default()
                 .fill(SURFACE_VARIANT)
@@ -582,16 +720,6 @@ impl StatusPanel {
                     );
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if p.files_copied > 0 {
-                            ui.label(
-                                egui::RichText::new(format!("↓  {} copied", p.files_copied))
-                                    .size(13.0)
-                                    .color(ACCENT),
-                            );
-                            if p.files_synced > 0 {
-                                ui.add_space(16.0);
-                            }
-                        }
                         if p.files_synced > 0 {
                             ui.label(
                                 egui::RichText::new(format!("↻  {} synced", p.files_synced))
@@ -725,18 +853,9 @@ impl StatusPanel {
         }
 
         // Running totals row
-        if p.files_copied > 0 || p.files_synced > 0 || p.files_failed > 0 {
+        if p.files_synced > 0 || p.files_failed > 0 {
             ui.add_space(14.0);
             ui.horizontal(|ui| {
-                if p.files_copied > 0 {
-                    ui.label(
-                        egui::RichText::new(format!("↓  {}", p.files_copied))
-                            .size(12.0)
-                            .color(ACCENT),
-                    );
-                    ui.label(egui::RichText::new(" copied").size(12.0).color(TEXT_SECONDARY));
-                    ui.add_space(12.0);
-                }
                 if p.files_synced > 0 {
                     ui.label(
                         egui::RichText::new(format!("↻  {}", p.files_synced))
@@ -886,14 +1005,19 @@ impl StatusPanel {
                         let target = sel_local_path(&self.sync_folder, &sel.path);
                         let nav_to = if target.exists() { target } else { root.clone() };
                         self.thumbnail_cache.clear();
+                        self.thumbnail_rx.clear();
+                        self.thumbnail_loading.clear();
                         self.nav_stack.clear();
                         self.nav_stack.push(root.clone());
                         // Push intermediate path segments
+                        self.dir_entries.clear();
+                        self.search_query.clear();
+                        self.is_loading = true;
                         if nav_to != root {
-                            self.dir_entries = load_dir_entries(&nav_to, &root);
+                            self.load_rx = Some(start_load(nav_to.clone(), root.clone()));
                             self.nav_stack.push(nav_to);
                         } else {
-                            self.dir_entries = load_dir_entries(&root, &root);
+                            self.load_rx = Some(start_load(root.clone(), root.clone()));
                         }
                         self.active_tab = BrowserTab::Files;
                     }
@@ -930,10 +1054,7 @@ impl StatusPanel {
                 let w = ui.available_width();
                 ui.set_width(w);
                 ui.horizontal(|ui| {
-                    let icon = match &sel.policy {
-                        SyncPolicy::Copy => "📋",
-                        SyncPolicy::KeepSynced { .. } => "📁",
-                    };
+                    let icon = "📁";
                     ui.label(egui::RichText::new(icon).size(15.0));
                     ui.add_space(6.0);
 
@@ -1018,6 +1139,27 @@ impl StatusPanel {
                         back_clicked = true;
                     }
 
+                    // Parent folder name next to back chevron
+                    if !at_root {
+                        if let Some(parent) = self.nav_stack.len().checked_sub(2)
+                            .and_then(|i| self.nav_stack.get(i))
+                        {
+                            let pname = parent.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("↑");
+                            if ui.add(egui::Button::new(
+                                    egui::RichText::new(pname).size(11.0).color(TEXT_SECONDARY))
+                                .fill(egui::Color32::TRANSPARENT)
+                                .frame(false))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .on_hover_text("Go to parent folder")
+                                .clicked()
+                            {
+                                back_clicked = true;
+                            }
+                        }
+                    }
+
                     ui.add_space(4.0);
                     let sep = ui.allocate_space(egui::vec2(1.0, 16.0)).1;
                     ui.painter().rect_filled(sep, 0.0, DIVIDER);
@@ -1049,24 +1191,43 @@ impl StatusPanel {
     fn render_browser_entries(&mut self, ui: &mut egui::Ui) -> Option<std::path::PathBuf> {
         let mut navigate_to: Option<std::path::PathBuf> = None;
 
-        if self.dir_entries.is_empty() {
+        let q = self.search_query.trim().to_lowercase();
+        let visible_count = self.dir_entries.iter()
+            .filter(|e| e.name != "..")
+            .filter(|e| q.is_empty() || e.name.to_lowercase().contains(&q))
+            .count();
+
+        if visible_count == 0 {
             egui::Frame::default()
                 .inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 24.0, bottom: 24.0 })
                 .show(ui, |ui| {
-                    ui.label(egui::RichText::new("Empty folder").size(13.0).color(TEXT_SECONDARY));
+                    let msg = if q.is_empty() { "Empty folder" } else { "No matching files" };
+                    ui.label(egui::RichText::new(msg).size(13.0).color(TEXT_SECONDARY));
                 });
             return None;
         }
 
-        // Pre-load thumbnails (once per path, cached)
-        let ctx = ui.ctx().clone();
-        let to_load: Vec<std::path::PathBuf> = self.dir_entries.iter()
-            .filter(|e| is_image_file(&e.name) && !self.thumbnail_cache.contains_key(&e.path))
+        // Dispatch async thumbnail decoding for images not yet queued or cached.
+        // image::open() is blocking — doing it on the UI thread freezes the panel.
+        // Limit to 4 spawns per frame: spawning many OS threads at once (CreateThread)
+        // blocks the main thread on Windows for tens of milliseconds each.
+        let to_enqueue: Vec<std::path::PathBuf> = self.dir_entries.iter()
+            .filter(|e| {
+                is_image_file(&e.name)
+                    && !self.thumbnail_cache.contains_key(&e.path)
+                    && !self.thumbnail_loading.contains(&e.path)
+            })
             .map(|e| e.path.clone())
+            .take(4) // max 4 new threads per frame — rest dispatched on subsequent repaints
             .collect();
-        for p in to_load {
-            let tex = load_thumbnail(&p, &ctx);
-            self.thumbnail_cache.insert(p, tex);
+        for p in to_enqueue {
+            self.thumbnail_loading.insert(p.clone());
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = load_color_image(&p);
+                let _ = tx.send((p, result));
+            });
+            self.thumbnail_rx.push(rx);
         }
 
         match self.view_mode {
@@ -1080,8 +1241,10 @@ impl StatusPanel {
                     let name    = self.dir_entries[idx].name.clone();
                     let path    = self.dir_entries[idx].path.clone();
                     let size_b  = self.dir_entries[idx].size_bytes;
+                    if name == ".." { continue; }
+                    if !q.is_empty() && !name.to_lowercase().contains(&q) { continue; }
 
-                    if Some(idx) == first_file_idx {
+                    if Some(idx) == first_file_idx && q.is_empty() {
                         let r = ui.allocate_space(egui::vec2(ui.available_width(), 1.0)).1;
                         ui.painter().rect_filled(r, 0.0, DIVIDER);
                     }
@@ -1118,13 +1281,6 @@ impl StatusPanel {
                                     let (r, _) = ui.allocate_exact_size(
                                         egui::vec2(40.0, 40.0), egui::Sense::hover());
                                     ui.painter().rect_filled(r, 4.0, SURFACE_VARIANT);
-                                } else if name == ".." {
-                                    let (ar, _) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::hover());
-                                    let (acx, acy) = (ar.center().x, ar.center().y);
-                                    let as_ = egui::Stroke::new(1.5, TEXT_SECONDARY);
-                                    ui.painter().line_segment([egui::pos2(acx, acy + 6.0), egui::pos2(acx, acy - 6.0)], as_);
-                                    ui.painter().line_segment([egui::pos2(acx - 4.0, acy - 2.0), egui::pos2(acx, acy - 6.0)], as_);
-                                    ui.painter().line_segment([egui::pos2(acx, acy - 6.0), egui::pos2(acx + 4.0, acy - 2.0)], as_);
                                 } else if is_dir {
                                     let (fr, _) = ui.allocate_exact_size(egui::vec2(32.0, 28.0), egui::Sense::hover());
                                     draw_folder_icon(ui.painter(), fr.shrink(2.0));
@@ -1133,17 +1289,10 @@ impl StatusPanel {
                                 }
                                 ui.add_space(10.0);
 
-                                let name_col = if name == ".." { TEXT_SECONDARY }
-                                    else if is_dir { FOLDER_COLOR }
-                                    else { TEXT_PRIMARY };
-                                let display = if name == ".." {
-                                    "Parent folder".to_string()
-                                } else {
-                                    name.clone()
-                                };
+                                let name_col = if is_dir { FOLDER_COLOR } else { TEXT_PRIMARY };
 
                                 ui.vertical(|ui| {
-                                    ui.label(egui::RichText::new(&display).size(12.5).color(name_col));
+                                    ui.label(egui::RichText::new(&name).size(12.5).color(name_col));
                                     if !is_dir && size_b > 0 {
                                         ui.label(egui::RichText::new(format_size(size_b))
                                             .size(10.5).color(TEXT_SECONDARY));
@@ -1151,15 +1300,23 @@ impl StatusPanel {
                                 });
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if is_dir && name != ".." {
+                                    if is_dir {
                                         ui.label(egui::RichText::new("›").size(16.0).color(TEXT_SECONDARY));
                                     }
                                 });
                             });
                         });
 
+                    let tooltip = if is_dir {
+                        name.clone()
+                    } else if size_b > 0 {
+                        format!("{}\n{}", name, format_size(size_b))
+                    } else {
+                        name.clone()
+                    };
                     let interact = ui.interact(row_resp.response.rect, row_id, egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(tooltip);
                     if interact.clicked() {
                         if is_dir { navigate_to = Some(path); } else { let _ = open::that(&path); }
                     }
@@ -1172,10 +1329,11 @@ impl StatusPanel {
                 let avail  = ui.available_width();
                 let cols   = ((avail - 16.0) / (tile_w + 6.0)).floor().max(2.0) as usize;
 
-                // Collect entry data (skip ".." — use back button instead)
+                // Collect entry data (skip ".." — use back button instead; apply search filter)
                 let entries: Vec<(usize, String, std::path::PathBuf, bool, bool)> =
                     self.dir_entries.iter().enumerate()
                         .filter(|(_, e)| e.name != "..")
+                        .filter(|(_, e)| q.is_empty() || e.name.to_lowercase().contains(&q))
                         .map(|(i, e)| (i, e.name.clone(), e.path.clone(), e.is_dir, is_image_file(&e.name)))
                         .collect();
 
@@ -1236,7 +1394,8 @@ impl StatusPanel {
 
                                     let inter = ui.interact(
                                         tile_resp.response.rect, tile_id, egui::Sense::click())
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(name.as_str());
                                     ui.ctx().data_mut(|d| d.insert_temp(tile_id, inter.hovered()));
                                     if inter.clicked() {
                                         if is_dir { navigate_to = Some(path.clone()); }
@@ -1279,6 +1438,8 @@ impl StatusPanel {
                     let path    = self.dir_entries[idx].path.clone();
                     let size_b  = self.dir_entries[idx].size_bytes;
                     let mod_s   = self.dir_entries[idx].modified_secs;
+                    if name == ".." { continue; }
+                    if !q.is_empty() && !name.to_lowercase().contains(&q) { continue; }
 
                     let row_id = ui.id().with(("dd", idx as u32));
                     let approx_rect = egui::Rect::from_min_size(
@@ -1306,13 +1467,6 @@ impl StatusPanel {
                                 if let Some(sized) = cached_tex {
                                     ui.add(egui::Image::new(egui::ImageSource::Texture(sized))
                                         .max_size(egui::vec2(24.0, 24.0)).rounding(3.0));
-                                } else if name == ".." {
-                                    let (ar, _) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::hover());
-                                    let (acx, acy) = (ar.center().x, ar.center().y);
-                                    let as_ = egui::Stroke::new(1.4, TEXT_SECONDARY);
-                                    ui.painter().line_segment([egui::pos2(acx, acy + 5.0), egui::pos2(acx, acy - 5.0)], as_);
-                                    ui.painter().line_segment([egui::pos2(acx - 3.5, acy - 1.5), egui::pos2(acx, acy - 5.0)], as_);
-                                    ui.painter().line_segment([egui::pos2(acx, acy - 5.0), egui::pos2(acx + 3.5, acy - 1.5)], as_);
                                 } else if is_dir {
                                     let (fr, _) = ui.allocate_exact_size(egui::vec2(24.0, 22.0), egui::Sense::hover());
                                     draw_folder_icon(ui.painter(), fr.shrink(2.0));
@@ -1321,15 +1475,8 @@ impl StatusPanel {
                                 }
                                 ui.add_space(8.0);
 
-                                let name_col = if name == ".." { TEXT_SECONDARY }
-                                    else if is_dir { FOLDER_COLOR }
-                                    else { TEXT_PRIMARY };
-                                let display = if name == ".." {
-                                    "Parent folder".to_string()
-                                } else {
-                                    name.clone()
-                                };
-                                ui.label(egui::RichText::new(&display).size(12.0).color(name_col));
+                                let name_col = if is_dir { FOLDER_COLOR } else { TEXT_PRIMARY };
+                                ui.label(egui::RichText::new(&name).size(12.0).color(name_col));
 
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if let Some(secs) = mod_s {
@@ -1346,8 +1493,16 @@ impl StatusPanel {
                             });
                         });
 
+                    let tooltip = if is_dir {
+                        name.clone()
+                    } else if size_b > 0 {
+                        format!("{}\n{}", name, format_size(size_b))
+                    } else {
+                        name.clone()
+                    };
                     let interact = ui.interact(row_resp.response.rect, row_id, egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(tooltip);
                     if interact.clicked() {
                         if is_dir { navigate_to = Some(path); } else { let _ = open::that(&path); }
                     }
@@ -1366,22 +1521,11 @@ impl StatusPanel {
 
 // ── Folder list helpers ────────────────────────────────────────────────────────
 
-fn folder_badge(sel: &FolderSelection, is_syncing: bool) -> (&'static str, egui::Color32) {
-    match &sel.policy {
-        SyncPolicy::Copy => {
-            if sel.completed {
-                ("✓ Copied", SUCCESS_COLOR)
-            } else {
-                ("Pending copy", TEXT_SECONDARY)
-            }
-        }
-        SyncPolicy::KeepSynced { .. } => {
-            if is_syncing {
-                ("Syncing", ACCENT)
-            } else {
-                ("↻ Synced", SUCCESS_COLOR)
-            }
-        }
+fn folder_badge(_sel: &FolderSelection, is_syncing: bool) -> (&'static str, egui::Color32) {
+    if is_syncing {
+        ("Syncing", ACCENT)
+    } else {
+        ("↻ Synced", SUCCESS_COLOR)
     }
 }
 
@@ -1426,7 +1570,11 @@ fn load_dir_entries(path: &std::path::Path, root: &std::path::Path) -> Vec<DirEn
         if is_dir { dirs.push(de); } else { files.push(de); }
     }
     dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // Files: most recently modified first; fall back to alphabetical when mtime is equal or missing.
+    files.sort_by(|a, b| {
+        b.modified_secs.cmp(&a.modified_secs)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 
     // Prepend ".." only if we are strictly inside the root (not at the root itself)
     let mut result = Vec::new();
@@ -1448,23 +1596,32 @@ fn load_dir_entries(path: &std::path::Path, root: &std::path::Path) -> Vec<DirEn
     result
 }
 
+/// Spawn a background thread to load directory entries, returning a receiver.
+fn start_load(path: std::path::PathBuf, root: std::path::PathBuf) -> std::sync::mpsc::Receiver<Vec<DirEntry>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let entries = load_dir_entries(&path, &root);
+        let _ = tx.send(entries);
+    });
+    rx
+}
+
 /// Returns true for image formats supported by the `image` crate features enabled.
 fn is_image_file(name: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
     matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp")
 }
 
-/// Load an image from disk, resize to max 96×96, and upload as an egui texture.
-/// Returns None on any error (format unsupported, file missing, decode failure).
-fn load_thumbnail(path: &std::path::Path, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+/// Decode an image from disk and resize to max 96×96 pixels.
+/// Pure CPU work — safe to call from a background thread.
+/// Returns None on any error (unsupported format, missing file, decode failure).
+fn load_color_image(path: &std::path::Path) -> Option<egui::ColorImage> {
     let img = image::open(path).ok()?;
     let img = img.thumbnail(96, 96);
     let img_rgba = img.to_rgba8();
     let (w, h) = (img_rgba.width() as usize, img_rgba.height() as usize);
     let pixels = img_rgba.into_raw();
-    let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels);
-    let key = path.to_string_lossy();
-    Some(ctx.load_texture(key.as_ref(), color_image, egui::TextureOptions::LINEAR))
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], &pixels))
 }
 
 /// Draw a Windows-style folder icon (tab + body) into `rect` using the painter.
