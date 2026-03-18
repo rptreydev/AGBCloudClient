@@ -134,6 +134,13 @@ Section "Main Application" SEC_MAIN
         Exec '"$INSTDIR\agb-cloud-client.exe"'
 
     launch_done:
+
+    ; ── Self-delete temp installer (silent update only) ───────────────────────
+    ; /S flag means this is an auto-update — installer lives in %TEMP%.
+    ; Schedule deletion via cmd (runs after NSIS exits).
+    ${If} ${Silent}
+        nsExec::Exec 'cmd /C "ping -n 2 127.0.0.1 >nul & del /F /Q "$EXEPATH""'
+    ${EndIf}
 SectionEnd
 
 ; ── Uninstaller Section ──
