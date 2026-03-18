@@ -151,6 +151,74 @@ impl Default for DownloadProgress {
     }
 }
 
+// ── Post-install success flag ─────────────────────────────────────────────────
+//
+// Written just before exit(0) so the newly-installed process can show a
+// "successfully updated" toast on its first startup.
+
+/// Path of the just-updated flag file (`%TEMP%\agb_just_updated.txt`).
+pub fn just_updated_flag_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("agb_just_updated.txt")
+}
+
+/// Write the installed version to the flag file.
+pub fn write_just_updated_flag(version: &str) {
+    let _ = std::fs::write(just_updated_flag_path(), version);
+}
+
+/// Read and immediately delete the flag. Returns the installed version string
+/// if this is the first run after an auto-update.
+pub fn take_just_updated_flag() -> Option<String> {
+    let path = just_updated_flag_path();
+    let version = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    Some(version.trim().to_string())
+}
+
+// ── Update toast notifications ────────────────────────────────────────────────
+
+fn toast(summary: &str, body: &str, timeout_ms: u32) {
+    use crate::ui::common::NOTIFICATION_APP_ID;
+    let summary = summary.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        notify_rust::Notification::new()
+            .app_id(NOTIFICATION_APP_ID)
+            .summary(&summary)
+            .body(&body)
+            .timeout(notify_rust::Timeout::Milliseconds(timeout_ms))
+            .show()
+            .ok();
+    });
+}
+
+/// Toast: "Downloading new version…"
+pub fn notify_downloading(version: &str) {
+    toast(
+        "⬆ Downloading update",
+        &format!("Downloading version {version}…"),
+        5000,
+    );
+}
+
+/// Toast: "Installing new version…"
+pub fn notify_installing(version: &str) {
+    toast(
+        "⚙ Installing update",
+        &format!("Installing version {version}. The app will restart automatically."),
+        8000,
+    );
+}
+
+/// Toast: "Successfully updated!" — called by the NEW process on first startup.
+pub fn notify_update_success(version: &str) {
+    toast(
+        "✅ Update installed",
+        &format!("Version {version} was installed successfully."),
+        8000,
+    );
+}
+
 // ── Installer download + launch ───────────────────────────────────────────────
 
 /// Download the installer to `%TEMP%\AGBCloudClient-update.exe` and run it
@@ -167,6 +235,9 @@ pub async fn download_and_install(
 
     let dest = std::env::temp_dir().join("AGBCloudClient-update.exe");
     info!("Downloading update {} → {:?}", info.version, dest);
+
+    // ── Notify: downloading ───────────────────────────────────────────────────
+    notify_downloading(&info.version);
 
     let client = reqwest::Client::new();
     let mut resp = client
@@ -198,7 +269,12 @@ pub async fn download_and_install(
         p.state = DownloadState::Installing;
     }
 
+    // ── Notify: installing ────────────────────────────────────────────────────
+    notify_installing(&info.version);
     info!("Download complete — launching installer silently");
+
+    // Write flag so the new process shows a success toast on first startup.
+    write_just_updated_flag(&info.version);
 
     #[cfg(target_os = "windows")]
     {

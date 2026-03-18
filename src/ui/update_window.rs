@@ -199,6 +199,7 @@ pub fn show_update_window(info: UpdateInfo, rt: &tokio::runtime::Runtime) {
             .with_resizable(false)
             .with_maximize_button(false)
             .with_minimize_button(false)
+            .with_always_on_top()
             .with_icon(crate::ui::icon::app_icon_data()),
         centered: true,
         ..Default::default()

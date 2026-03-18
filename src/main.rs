@@ -485,6 +485,14 @@ fn main() {
         }
     }
 
+    // ── Post-update success notification ─────────────────────────────────────
+    // If the previous process wrote a just_updated flag before exiting, show
+    // a "Successfully installed" toast now that the new version is running.
+    if let Some(version) = update::take_just_updated_flag() {
+        info!("First run after update to v{version} — showing success notification");
+        update::notify_update_success(&version);
+    }
+
     info!(
         "Starting sync with {} selected folder(s)",
         config.selected_folders.len()
