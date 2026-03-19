@@ -156,6 +156,7 @@ When a new installer is ready:
 | Version | Date | Type | Summary |
 |---------|------|------|---------|
 | `0.1.0-alpha.1` | 2026-03-19 | Initial alpha | First deploy: wizard, tray, sync, file browser, status panel, auto-update, company WS, install tracking |
+| `0.1.0-alpha.2` | 2026-03-19 | Revision | Fix: app slug mismatch (agb-cloud-client), WS payload nested under versionData, check-update URL |
 
 ---
 

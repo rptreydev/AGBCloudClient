@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 /// Update information returned by the server version endpoint or WS event.
 ///
-/// Startup check: GET `{server_url}/app-distribution/check-update/AGBCloudClient`
+/// Startup check: GET `{server_url}/app-distribution/check-update/agb-cloud-client`
 /// WS event: `app.distribution.version_published` payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
@@ -42,7 +42,7 @@ pub async fn register_client_event(
     http: &reqwest::Client,
 ) {
     let mut body = serde_json::json!({
-        "appName":       "AGBCloudClient",
+        "appName":       "agb-cloud-client",
         "event":         event,
         "machineId":     get_machine_id(),
         "machineName":   get_machine_name(),
@@ -62,7 +62,7 @@ pub async fn register_client_event(
         .await
     {
         Ok(r) if r.status().is_success() => {
-            info!("Registered client event {:?} for AGBCloudClient {current_version}", event);
+            info!("Registered client event {:?} for agb-cloud-client {current_version}", event);
         }
         Ok(r) => warn!("Client event registration failed: HTTP {}", r.status()),
         Err(e) => warn!("Client event registration failed: {e}"),

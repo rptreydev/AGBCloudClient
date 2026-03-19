@@ -10,7 +10,7 @@
 
 ; ── Product info ──
 !define PRODUCT_NAME "AGB Cloud Client"
-!define PRODUCT_VERSION "0.1.0-alpha.1"
+!define PRODUCT_VERSION "0.1.0-alpha.2"
 !define PRODUCT_PUBLISHER "AGBroadband"
 !define PRODUCT_WEB_SITE "https://agbroadband.net"
 !define PRODUCT_DIR_REGKEY "Software\${PRODUCT_PUBLISHER}\AGBCloudClient"

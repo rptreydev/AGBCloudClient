@@ -186,11 +186,13 @@ impl WsClient {
 
                     // Only process events for this app.
                     let app_name = val.get("appName").and_then(|v| v.as_str()).unwrap_or("");
-                    if app_name != "AGBCloudClient" { return; }
+                    if app_name != "agb-cloud-client" { return; }
 
-                    let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let version_id = val.get("versionId").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let is_mandatory = val.get("isMandatory").and_then(|v| v.as_bool()).unwrap_or(false);
+                    // Backend payload: { appName, versionData: { id, version, isMandatory, ... } }
+                    let vd = val.get("versionData");
+                    let version = vd.and_then(|v| v.get("version")).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let version_id = vd.and_then(|v| v.get("id")).and_then(|v| v.as_u64()).unwrap_or(0);
+                    let is_mandatory = vd.and_then(|v| v.get("isMandatory")).and_then(|v| v.as_bool()).unwrap_or(false);
 
                     if version.is_empty() || version_id == 0 {
                         warn!("WS: app.distribution.version_published — missing version or versionId");

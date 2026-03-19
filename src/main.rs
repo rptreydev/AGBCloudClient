@@ -504,7 +504,7 @@ fn main() {
     {
         let check_url = if config.update_check_url.is_empty() {
             format!(
-                "{}/app-distribution/check-update/AGBCloudClient",
+                "{}/app-distribution/check-update/agb-cloud-client",
                 config.server_url
             )
         } else {
