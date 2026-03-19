@@ -17,7 +17,7 @@ const EV_CS_CHANGED: &str = "company_supervisor.changed";
 /// Emitted by the backend when a new installer is published.
 /// Payload: { "version": "x.y.z", "downloadUrl": "https://..." }
 /// Backend event name confirmed when the endpoint is implemented — update here if needed.
-const EV_APP_UPDATE: &str = "app.distribution.version_published";
+const EV_APP_UPDATE: &str = "app_distribution.version_published";
 
 // ── Tree patch (company assignment delta) ────────────────────────────────────
 

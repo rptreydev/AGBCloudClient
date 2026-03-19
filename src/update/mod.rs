@@ -35,6 +35,7 @@ pub enum ClientEventType {
 /// Fire-and-forget — errors are logged but never propagated.
 pub async fn register_client_event(
     server_url: &str,
+    jwt: &str,
     event: ClientEventType,
     current_version: &str,
     previous_version: Option<&str>,
@@ -54,6 +55,7 @@ pub async fn register_client_event(
     let url = format!("{}/app-distribution/clients/event", server_url);
     match http
         .post(&url)
+        .header("Cookie", format!("jwt={jwt}"))
         .json(&body)
         .timeout(std::time::Duration::from_secs(10))
         .send()

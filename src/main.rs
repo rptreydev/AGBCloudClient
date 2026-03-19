@@ -497,10 +497,12 @@ fn main() {
         update::notify_update_success(&new_version);
         let http = auth_state.client().clone();
         let server_url = config.server_url.clone();
+        let jwt = rt.block_on(auth_state.get_token()).unwrap_or_default();
         let prev = if prev_version.is_empty() { None } else { Some(prev_version) };
         rt.spawn(async move {
             update::register_client_event(
                 &server_url,
+                &jwt,
                 update::ClientEventType::Updated,
                 &new_version,
                 prev.as_deref(),
@@ -516,9 +518,11 @@ fn main() {
     {
         let http = auth_state.client().clone();
         let server_url = config.server_url.clone();
+        let jwt = rt.block_on(auth_state.get_token()).unwrap_or_default();
         rt.spawn(async move {
             update::register_client_event(
                 &server_url,
+                &jwt,
                 update::ClientEventType::Installed,
                 env!("CARGO_PKG_VERSION"),
                 None,
