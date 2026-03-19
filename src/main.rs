@@ -309,7 +309,7 @@ fn main() {
                 warn!("--update: no version/url provided and no flag file found");
             }
         } else {
-            let info = update::UpdateInfo { version, download_url: url };
+            let info = update::UpdateInfo { version, download_url: url, is_mandatory: true };
             info!("Update mode — showing window for v{}", info.version);
             ui::show_update_window(info, &rt);
         }
@@ -462,18 +462,22 @@ fn main() {
 
     // ── Startup update check ──────────────────────────────────────────────────
     // 1. If a previous WS event left a flag file, an update is still pending.
-    // 2. Otherwise, poll the version endpoint if one is configured.
+    // 2. Otherwise, poll the version endpoint (derived from server_url when
+    //    update_check_url is empty, or use the configured URL).
     // If an update is found → spawn the mandatory update window + block the
     // tray in update-mode (sync disabled, menu limited).
-    // To wire the endpoint: set `config.update_check_url` to the backend URL.
     {
+        let check_url = if config.update_check_url.is_empty() {
+            format!(
+                "{}/app-distribution/check-update/AGBCloudClient",
+                config.server_url
+            )
+        } else {
+            config.update_check_url.clone()
+        };
         let pending = read_update_flag().or_else(|| {
-            if config.update_check_url.is_empty() {
-                None
-            } else {
-                let http = auth_state.client();
-                rt.block_on(check_for_update(&config.update_check_url, &http))
-            }
+            let http = auth_state.client();
+            rt.block_on(check_for_update(&check_url, http))
         });
         if let Some(info) = pending {
             write_update_flag(&info);
@@ -485,12 +489,43 @@ fn main() {
         }
     }
 
-    // ── Post-update success notification ─────────────────────────────────────
+    // ── Post-update success notification + event registration ────────────────
     // If the previous process wrote a just_updated flag before exiting, show
-    // a "Successfully installed" toast now that the new version is running.
-    if let Some(version) = update::take_just_updated_flag() {
-        info!("First run after update to v{version} — showing success notification");
-        update::notify_update_success(&version);
+    // a "Successfully installed" toast and report the UPDATE event to the backend.
+    if let Some((new_version, prev_version)) = update::take_just_updated_flag() {
+        info!("First run after update to v{new_version} — showing success notification");
+        update::notify_update_success(&new_version);
+        let http = auth_state.client().clone();
+        let server_url = config.server_url.clone();
+        let prev = if prev_version.is_empty() { None } else { Some(prev_version) };
+        rt.spawn(async move {
+            update::register_client_event(
+                &server_url,
+                update::ClientEventType::Updated,
+                &new_version,
+                prev.as_deref(),
+                &http,
+            )
+            .await;
+        });
+    }
+
+    // ── Register this installation on startup ─────────────────────────────────
+    // Fire-and-forget: keeps AppClientStatus up-to-date on the server
+    // (current version, machine name, last-seen timestamp).
+    {
+        let http = auth_state.client().clone();
+        let server_url = config.server_url.clone();
+        rt.spawn(async move {
+            update::register_client_event(
+                &server_url,
+                update::ClientEventType::Installed,
+                env!("CARGO_PKG_VERSION"),
+                None,
+                &http,
+            )
+            .await;
+        });
     }
 
     info!(

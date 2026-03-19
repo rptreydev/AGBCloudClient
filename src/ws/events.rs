@@ -17,7 +17,7 @@ const EV_CS_CHANGED: &str = "company_supervisor.changed";
 /// Emitted by the backend when a new installer is published.
 /// Payload: { "version": "x.y.z", "downloadUrl": "https://..." }
 /// Backend event name confirmed when the endpoint is implemented — update here if needed.
-const EV_APP_UPDATE: &str = "app.update_available";
+const EV_APP_UPDATE: &str = "app.distribution.version_published";
 
 // ── Tree patch (company assignment delta) ────────────────────────────────────
 
@@ -131,6 +131,9 @@ impl WsClient {
         // Clone tree-patch sender for the company_supervisor.changed handler.
         let patch_tx = tree_patch.clone();
 
+        // Clone server_url so the update handler closure can own it.
+        let server_url_for_update = config.server_url.clone();
+
         let _socket = rust_socketio::asynchronous::ClientBuilder::new(url)
             .namespace("/notifications")
             .on(EV_CREATED, move |payload, _| {
@@ -174,19 +177,41 @@ impl WsClient {
             })
             .on(EV_APP_UPDATE, move |payload, _| {
                 let tx = update_tx.clone();
+                let server_url = server_url_for_update.clone();
                 Box::pin(async move {
                     let Some(tx) = tx else { return };
-                    // Parse { "version": "...", "downloadUrl": "..." }
+                    // Payload: { appId, appName, version, channel, versionId, isMandatory }
                     let rust_socketio::Payload::Text(values) = payload else { return };
                     let Some(val) = values.first() else { return };
+
+                    // Only process events for this app.
+                    let app_name = val.get("appName").and_then(|v| v.as_str()).unwrap_or("");
+                    if app_name != "AGBCloudClient" { return; }
+
                     let version = val.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let download_url = val.get("downloadUrl").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if version.is_empty() || download_url.is_empty() {
-                        warn!("WS: app.update_available — missing version or downloadUrl");
+                    let version_id = val.get("versionId").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let is_mandatory = val.get("isMandatory").and_then(|v| v.as_bool()).unwrap_or(false);
+
+                    if version.is_empty() || version_id == 0 {
+                        warn!("WS: app.distribution.version_published — missing version or versionId");
                         return;
                     }
-                    info!("WS: app.update_available — version {version}");
-                    let _ = tx.send(UpdateInfo { version, download_url });
+
+                    if !crate::update::is_newer_version(&version) {
+                        info!("WS: version_published for {version} — already up to date, ignoring");
+                        return;
+                    }
+
+                    // Construct absolute download URL from server_url + versionId.
+                    let download_url = format!(
+                        "{}/app-distribution/versions/{}/download",
+                        server_url, version_id
+                    );
+                    info!(
+                        "WS: app.distribution.version_published — version {version} \
+                         mandatory={is_mandatory}"
+                    );
+                    let _ = tx.send(UpdateInfo { version, download_url, is_mandatory });
                 })
             })
             .on("disconnect", move |_, _| {

@@ -6,16 +6,103 @@ use tracing::{info, warn};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-/// Update information returned by the server version endpoint.
+/// Update information returned by the server version endpoint or WS event.
 ///
-/// Endpoint (to be configured in `AppConfig::update_check_url`):
-///   GET <update_check_url>
-///   Response: { "version": "0.1.0-beta.2", "downloadUrl": "https://..." }
+/// Startup check: GET `{server_url}/app-distribution/check-update/AGBCloudClient`
+/// WS event: `app.distribution.version_published` payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
     pub version: String,
     #[serde(rename = "downloadUrl")]
     pub download_url: String,
+    /// When `true` the app blocks until the update is installed.
+    #[serde(default)]
+    pub is_mandatory: bool,
+}
+
+// ── Client event reporting ────────────────────────────────────────────────────
+
+/// Mirrors the backend `ClientEventType` enum.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ClientEventType {
+    Installed,
+    Updated,
+    Uninstalled,
+}
+
+/// Report an install / update / uninstall event to the backend.
+/// Fire-and-forget — errors are logged but never propagated.
+pub async fn register_client_event(
+    server_url: &str,
+    event: ClientEventType,
+    current_version: &str,
+    previous_version: Option<&str>,
+    http: &reqwest::Client,
+) {
+    let mut body = serde_json::json!({
+        "appName":       "AGBCloudClient",
+        "event":         event,
+        "machineId":     get_machine_id(),
+        "machineName":   get_machine_name(),
+        "currentVersion": current_version,
+    });
+    if let Some(prev) = previous_version {
+        body["previousVersion"] = serde_json::Value::String(prev.to_string());
+    }
+
+    let url = format!("{}/app-distribution/clients/event", server_url);
+    match http
+        .post(&url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            info!("Registered client event {:?} for AGBCloudClient {current_version}", event);
+        }
+        Ok(r) => warn!("Client event registration failed: HTTP {}", r.status()),
+        Err(e) => warn!("Client event registration failed: {e}"),
+    }
+}
+
+/// Windows MACHINE_GUID from `HKLM\SOFTWARE\Microsoft\Cryptography`.
+/// Falls back to `COMPUTERNAME` env var if the registry key is unavailable.
+pub fn get_machine_id() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if let Ok(out) = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("MachineGuid") {
+                    if let Some(guid) = t.split_whitespace().last() {
+                        return guid.to_string();
+                    }
+                }
+            }
+        }
+    }
+    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Human-readable machine name (`COMPUTERNAME` / `HOSTNAME`).
+pub fn get_machine_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 // ── Version comparison ─────────────────────────────────────────────────────────
@@ -72,7 +159,18 @@ pub async fn check_for_update(url: &str, http: &reqwest::Client) -> Option<Updat
     };
 
     match resp.json::<UpdateInfo>().await {
-        Ok(info) if is_newer_version(&info.version) => {
+        Ok(mut info) if is_newer_version(&info.version) => {
+            // Backend may return a relative path like /app-distribution/versions/5/download.
+            // Make it absolute using the configured server URL.
+            if info.download_url.starts_with('/') {
+                // Strip the /api/v2 suffix from server_url to get the base origin.
+                let base = url
+                    .split("/app-distribution")
+                    .next()
+                    .unwrap_or(url)
+                    .trim_end_matches("/api/v2");
+                info.download_url = format!("{}{}", base, info.download_url);
+            }
             info!(
                 "Update available: {} (current: {})",
                 info.version,
@@ -156,23 +254,40 @@ impl Default for DownloadProgress {
 // Written just before exit(0) so the newly-installed process can show a
 // "successfully updated" toast on its first startup.
 
-/// Path of the just-updated flag file (`%TEMP%\agb_just_updated.txt`).
+/// Path of the just-updated flag file (`%TEMP%\agb_just_updated.json`).
 pub fn just_updated_flag_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("agb_just_updated.txt")
+    std::env::temp_dir().join("agb_just_updated.json")
 }
 
-/// Write the installed version to the flag file.
-pub fn write_just_updated_flag(version: &str) {
-    let _ = std::fs::write(just_updated_flag_path(), version);
+#[derive(Serialize, Deserialize)]
+struct JustUpdatedInfo {
+    new_version: String,
+    previous_version: String,
 }
 
-/// Read and immediately delete the flag. Returns the installed version string
-/// if this is the first run after an auto-update.
-pub fn take_just_updated_flag() -> Option<String> {
+/// Write both old and new version so the new process can report the UPDATE event.
+pub fn write_just_updated_flag(new_version: &str, previous_version: &str) {
+    let info = JustUpdatedInfo {
+        new_version: new_version.to_string(),
+        previous_version: previous_version.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string(&info) {
+        let _ = std::fs::write(just_updated_flag_path(), json);
+    }
+}
+
+/// Read and immediately delete the flag.
+/// Returns `(new_version, previous_version)` on the first run after an auto-update.
+pub fn take_just_updated_flag() -> Option<(String, String)> {
     let path = just_updated_flag_path();
-    let version = std::fs::read_to_string(&path).ok()?;
+    let data = std::fs::read_to_string(&path).ok()?;
     let _ = std::fs::remove_file(&path);
-    Some(version.trim().to_string())
+    // Try JSON format first, fall back to legacy plain-text (single version string).
+    if let Ok(info) = serde_json::from_str::<JustUpdatedInfo>(&data) {
+        Some((info.new_version, info.previous_version))
+    } else {
+        Some((data.trim().to_string(), String::new()))
+    }
 }
 
 // ── Update toast notifications ────────────────────────────────────────────────
@@ -273,8 +388,8 @@ pub async fn download_and_install(
     notify_installing(&info.version);
     info!("Download complete — launching installer silently");
 
-    // Write flag so the new process shows a success toast on first startup.
-    write_just_updated_flag(&info.version);
+    // Write flag so the new process shows a success toast and reports the UPDATE event.
+    write_just_updated_flag(&info.version, env!("CARGO_PKG_VERSION"));
 
     #[cfg(target_os = "windows")]
     {
