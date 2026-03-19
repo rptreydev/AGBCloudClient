@@ -282,6 +282,16 @@ impl SyncEngine {
             &file.name, file.mime.as_deref(), company, project, location,
         );
 
+        // Report download event to backend activity log (fire-and-forget).
+        self.remote.report_download(
+            &file.name,
+            file.size,
+            file.id,
+            company,
+            project,
+            location,
+        ).await;
+
         self.update_progress(|p| {
             p.files_done += 1;
             p.files_downloaded += 1;

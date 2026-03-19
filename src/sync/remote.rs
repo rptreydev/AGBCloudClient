@@ -282,4 +282,52 @@ impl RemoteClient {
         nodes.into_iter().next()
             .ok_or_else(|| anyhow::anyhow!("Empty tree response for {root_uuid}"))
     }
+
+    /// Report a completed file download to the backend activity log.
+    /// `POST /app-distribution/clients/download` — requires auth.
+    /// Fire-and-forget — errors are logged but never propagated.
+    pub async fn report_download(
+        &self,
+        file_name: &str,
+        file_size: Option<i64>,
+        file_id: Option<i64>,
+        company_name: Option<&str>,
+        project_num: Option<&str>,
+        location_name: Option<&str>,
+    ) {
+        let Some(jwt) = self.auth.get_token().await else {
+            warn!("report_download: no JWT — skipping");
+            return;
+        };
+
+        let machine_id = crate::update::get_machine_id();
+        let url = format!("{}/app-distribution/clients/download", self.auth.server_url());
+
+        let mut body = serde_json::json!({
+            "appName":   "agb-cloud-client",
+            "machineId": machine_id,
+            "fileName":  file_name,
+        });
+        if let Some(sz) = file_size { body["fileSize"] = sz.into(); }
+        if let Some(id) = file_id   { body["fileId"]   = id.into(); }
+        if let Some(c)  = company_name  { body["companyName"]  = c.into(); }
+        if let Some(p)  = project_num   { body["projectNum"]   = p.into(); }
+        if let Some(l)  = location_name { body["locationName"] = l.into(); }
+
+        match self.auth.client()
+            .post(&url)
+            .header("Cookie", format!("jwt={jwt}"))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() =>
+                debug!("Reported download: {file_name}"),
+            Ok(r) =>
+                warn!("report_download failed: HTTP {}", r.status()),
+            Err(e) =>
+                warn!("report_download error: {e}"),
+        }
+    }
 }
