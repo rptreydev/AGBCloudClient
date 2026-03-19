@@ -321,9 +321,13 @@ fn main() {
     }
 
     // Handle --update (spawned by tray when a new version is available).
-    // Shows a mandatory update window — the user cannot proceed without installing.
+    // Shows the update window — user can install or dismiss ("Remind me later").
     // Args: --update --version <ver> --url <download_url>
     if update_mode {
+        // Restore session so we can authenticate the download request.
+        rt.block_on(auth_state.try_restore_session());
+        let jwt = rt.block_on(auth_state.get_token()).unwrap_or_default();
+
         let version = args.iter()
             .position(|a| a == "--version")
             .and_then(|i| args.get(i + 1))
@@ -339,14 +343,14 @@ fn main() {
             // Fallback: read from flag file (written by previous WS event).
             if let Some(info) = read_update_flag() {
                 info!("Update mode — showing window for v{}", info.version);
-                ui::show_update_window(info, &rt);
+                ui::show_update_window(info, jwt, &rt);
             } else {
                 warn!("--update: no version/url provided and no flag file found");
             }
         } else {
             let info = update::UpdateInfo { version, download_url: url, is_mandatory: true };
             info!("Update mode — showing window for v{}", info.version);
-            ui::show_update_window(info, &rt);
+            ui::show_update_window(info, jwt, &rt);
         }
         std::process::exit(0);
     }

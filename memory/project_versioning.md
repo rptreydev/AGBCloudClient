@@ -158,6 +158,8 @@ When a new installer is ready:
 | `0.1.0-alpha.1` | 2026-03-19 | Initial alpha | First deploy: wizard, tray, sync, file browser, status panel, auto-update, company WS, install tracking |
 | `0.1.0-alpha.2` | 2026-03-19 | Revision | Fix: app slug mismatch (agb-cloud-client), WS payload nested under versionData, check-update URL |
 | `0.1.0-alpha.3` | 2026-03-19 | Revision | Feat: report file download events to backend activity log (POST /app-distribution/clients/download) |
+| `0.1.0-alpha.4` | 2026-03-19 | Revision | Fix: JWT auth in update download (endpoint not public); update window dismissible ("Remind me later") |
+| `0.1.0-alpha.5` | 2026-03-19 | Revision | Feat: installed version visible in tray tooltip, status panel user card, and all tooltip states |
 
 ---
 

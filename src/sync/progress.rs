@@ -45,27 +45,35 @@ impl SyncProgress {
         match &self.phase {
             SyncPhase::Idle => {
                 if self.files_done > 0 {
-                    format!("AGB Cloud Client — Up to date ({} files)", self.files_done)
+                    format!(
+                        "AGB Cloud Client v{} — Up to date ({} files)",
+                        env!("CARGO_PKG_VERSION"),
+                        self.files_done
+                    )
                 } else {
-                    "AGB Cloud Client — Idle".to_string()
+                    format!("AGB Cloud Client v{} — Idle", env!("CARGO_PKG_VERSION"))
                 }
             }
             SyncPhase::Syncing => {
                 if !self.current_file.is_empty() {
                     format!(
-                        "AGB Cloud Client — Downloading: {} ({} done)",
-                        self.current_file, self.files_done
+                        "AGB Cloud Client v{} — Downloading: {} ({} done)",
+                        env!("CARGO_PKG_VERSION"),
+                        self.current_file,
+                        self.files_done
                     )
                 } else {
                     format!(
-                        "AGB Cloud Client — Syncing: {} ({} files)",
-                        self.current_folder, self.files_done
+                        "AGB Cloud Client v{} — Syncing: {} ({} files)",
+                        env!("CARGO_PKG_VERSION"),
+                        self.current_folder,
+                        self.files_done
                     )
                 }
             }
             SyncPhase::Error(e) => {
                 let short = if e.len() > 60 { &e[..60] } else { e };
-                format!("AGB Cloud Client — Error: {short}")
+                format!("AGB Cloud Client v{} — Error: {short}", env!("CARGO_PKG_VERSION"))
             }
         }
     }

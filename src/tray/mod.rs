@@ -231,7 +231,7 @@ pub fn run_tray(
             // NOTE: no .with_menu() — we show the menu manually on right-click only,
             // which prevents the menu from also appearing on left-click.
             match TrayIconBuilder::new()
-                .with_tooltip("AGB Cloud Client — AGBroadband")
+                .with_tooltip(&format!("AGB Cloud Client v{} — AGBroadband", env!("CARGO_PKG_VERSION")))
                 .with_icon(icon)
                 .build()
             {

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use egui::{Context, RichText, ViewportCommand};
+use egui::{Context, RichText};
 use tracing::error;
 
 use crate::update::{download_and_install, DownloadProgress, DownloadState, UpdateInfo};
@@ -10,6 +10,7 @@ use crate::ui::common::*;
 
 struct UpdateApp {
     info: UpdateInfo,
+    jwt: String,
     progress: Arc<Mutex<DownloadProgress>>,
     rt_handle: tokio::runtime::Handle,
     download_started: bool,
@@ -17,11 +18,6 @@ struct UpdateApp {
 
 impl eframe::App for UpdateApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        // Block the window-close button — the update is mandatory.
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-        }
-
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(SURFACE))
             .show(ctx, |ui| self.render(ui));
@@ -91,12 +87,13 @@ impl UpdateApp {
                     if ui.add(btn).clicked() && !self.download_started {
                         self.download_started = true;
                         let info = self.info.clone();
+                        let jwt = self.jwt.clone();
                         let progress = self.progress.clone();
                         let handle = self.rt_handle.clone();
                         std::thread::spawn(move || {
                             handle.block_on(async move {
                                 if let Err(e) =
-                                    download_and_install(&info, progress.clone()).await
+                                    download_and_install(&info, &jwt, progress.clone()).await
                                 {
                                     error!("Update download failed: {e}");
                                     let mut p = progress.lock().unwrap();
@@ -174,19 +171,39 @@ impl UpdateApp {
                     .size(11.0)
                     .color(TEXT_SECONDARY),
             );
+            ui.add_space(10.0);
+            // Allow dismissing the window — the flag file remains, so the update
+            // will be shown again on next launch.
+            if matches!(&p.state, DownloadState::Idle | DownloadState::Failed(_)) {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new("Remind me later")
+                                .size(11.0)
+                                .color(TEXT_SECONDARY),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .clicked()
+                {
+                    std::process::exit(0);
+                }
+            }
         });
     }
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Show the mandatory update window. The close button is disabled — the user
-/// must click "Install Now". The window exits via `std::process::exit(0)`
-/// after the installer is launched.
-pub fn show_update_window(info: UpdateInfo, rt: &tokio::runtime::Runtime) {
+/// Show the update window. The user can dismiss it ("Remind me later") —
+/// the flag file stays on disk so the update is offered again on next launch.
+/// The window exits via `std::process::exit(0)` after the installer is launched.
+pub fn show_update_window(info: UpdateInfo, jwt: String, rt: &tokio::runtime::Runtime) {
     let progress = Arc::new(Mutex::new(DownloadProgress::default()));
     let app = UpdateApp {
         info,
+        jwt,
         progress,
         rt_handle: rt.handle().clone(),
         download_started: false,

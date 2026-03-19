@@ -1,6 +1,6 @@
 [package]
 name = "agb-cloud-client"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.5"
 edition = "2024"
 description = "AGB Cloud Client — AGBroadband Desktop Sync Client"
 authors = ["AGBroadband"]

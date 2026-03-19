@@ -374,6 +374,7 @@ pub fn notify_update_success(version: &str) {
 /// after launching the installer so the new version can acquire file locks.
 pub async fn download_and_install(
     info: &UpdateInfo,
+    jwt: &str,
     progress: Arc<Mutex<DownloadProgress>>,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -387,9 +388,17 @@ pub async fn download_and_install(
     let client = reqwest::Client::new();
     let mut resp = client
         .get(&info.download_url)
+        .header("Cookie", format!("jwt={jwt}"))
         .timeout(std::time::Duration::from_secs(300))
         .send()
         .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        let preview = &body[..body.len().min(200)];
+        anyhow::bail!("Download failed: HTTP {status} — {preview}");
+    }
 
     let total = resp.content_length().unwrap_or(0);
     {

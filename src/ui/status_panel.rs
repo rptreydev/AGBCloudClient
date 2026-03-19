@@ -715,6 +715,13 @@ impl StatusPanel {
                             .size(12.0)
                             .color(TEXT_SECONDARY),
                         );
+                        ui.add_space(2.0);
+                        // installed version
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(10.5)
+                                .color(TEXT_SECONDARY.linear_multiply(0.6)),
+                        );
                     });
                 });
             });
