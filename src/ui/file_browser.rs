@@ -73,6 +73,9 @@ impl FileBrowserApp {
 impl eframe::App for FileBrowserApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Exit immediately if the tray has requested a global shutdown.
+        // Repaint every second so this check fires even without user interaction
+        // (egui only calls update() on input events otherwise).
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
         if crate::ui::common::is_shutdown_requested() {
             std::process::exit(0);
         }

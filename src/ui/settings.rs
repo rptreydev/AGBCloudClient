@@ -639,6 +639,8 @@ struct SettingsWrapper {
 impl eframe::App for SettingsWrapper {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Exit immediately if the tray has requested a global shutdown.
+        // Repaint every second so this check fires even without user interaction.
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
         if crate::ui::common::is_shutdown_requested() {
             std::process::exit(0);
         }
@@ -663,6 +665,12 @@ impl eframe::App for SettingsWrapper {
                 } else {
                     info!("Settings saved to config ({count} folders)");
                     self.inner.save_message = format!("Saved! ({count} folders selected)");
+                    // Signal the tray process to trigger an immediate sync cycle
+                    // so newly selected folders start syncing without waiting for a
+                    // WS event. The tray polls progress.json every ~5 s.
+                    let mut prog = crate::sync::progress::read_progress_file();
+                    prog.sync_requested = true;
+                    crate::sync::progress::write_progress_file(&prog);
                 }
                 // Apply auto-start here (inside eframe) so it runs before GPU teardown
                 if let Err(e) = crate::ui::common::set_auto_start(cfg.auto_start) {
