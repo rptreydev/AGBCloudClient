@@ -155,8 +155,7 @@ When a new installer is ready:
 
 | Version | Date | Type | Summary |
 |---------|------|------|---------|
-| `0.1.0-beta.1` | 2026-01-15 | Initial beta | First public beta: wizard, tray, sync, file browser, status panel |
-| `0.2.0-beta.1` | 2026-03-19 | Minor | Auto-update, company WS notifications, install tracking, session restore fix, adaptive UI |
+| `0.1.0-alpha.1` | 2026-03-19 | Initial alpha | First deploy: wizard, tray, sync, file browser, status panel, auto-update, company WS, install tracking |
 
 ---
 
