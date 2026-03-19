@@ -38,9 +38,13 @@ enum ViewMode { List, Grid, Details }
 /// Show the iCloud-style status panel positioned at the bottom-right of the screen.
 /// Always calls `process::exit(0)` — never returns.
 pub fn show_status_panel(auth: &AuthState, rt: &tokio::runtime::Runtime) {
-    let (_, _, wa_right, wa_bottom) = work_area();
-    let win_w = 340.0_f32;
-    let win_h = (wa_bottom * 0.75).clamp(500.0, 720.0);
+    let (wa_left, wa_top, wa_right, wa_bottom) = work_area();
+    let wa_w = wa_right - wa_left;
+    let wa_h = wa_bottom - wa_top;
+    // Width: ~18% of screen width, clamped between 300 and 440 px.
+    let win_w = (wa_w * 0.18).clamp(300.0, 440.0);
+    // Height: ~82% of available work area, clamped between 480 and 920 px.
+    let win_h = (wa_h * 0.82).clamp(480.0, 920.0);
     let pos_x = (wa_right - win_w - 8.0).max(0.0);
     let pos_y = (wa_bottom - win_h - 8.0).max(0.0);
 
@@ -79,7 +83,7 @@ pub fn show_status_panel(auth: &AuthState, rt: &tokio::runtime::Runtime) {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([win_w, win_h])
-            .with_min_inner_size([300.0, 420.0])
+            .with_min_inner_size([300.0, 480.0])
             .with_position([pos_x, pos_y])
             .with_resizable(false)
             .with_decorations(false)
