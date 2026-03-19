@@ -121,10 +121,27 @@ impl AuthState {
     }
 
     /// Restore session using only a stored JWT (no refresh call).
-    /// Used as a fallback when no refresh_token is available.
+    /// Validates the token against the server before accepting it — a stored JWT
+    /// may be expired (30-min TTL) even though it exists in the keychain.
     async fn restore_from_stored_jwt(&self, username: &str) -> bool {
-        match CredentialStore::get_token(username) {
-            Ok(Some(token)) => {
+        let token = match CredentialStore::get_token(username) {
+            Ok(Some(t)) => t,
+            _ => {
+                warn!("No stored JWT for: {username} — session restore failed");
+                return false;
+            }
+        };
+
+        // Validate the token with a lightweight call before accepting it.
+        // If the server returns 401 the token is expired; fall through to Path 3.
+        let profile_url = format!("{}/authentication/profile", self.config.server_url);
+        match self.client
+            .get(&profile_url)
+            .header("Cookie", format!("jwt={token}"))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
                 let mut inner = self.inner.write().await;
                 inner.access_token = Some(token);
                 inner.is_authenticated = true;
@@ -134,9 +151,22 @@ impl AuthState {
                 info!("Session restored from stored JWT for: {username}");
                 true
             }
-            _ => {
-                warn!("No stored JWT for: {username} — session restore failed");
+            Ok(resp) => {
+                warn!(
+                    "Stored JWT is invalid/expired (HTTP {}) for: {username} — falling through to auto-login",
+                    resp.status()
+                );
                 false
+            }
+            Err(e) => {
+                // Network error — accept the stored JWT optimistically so the app
+                // can start offline; API calls will fail individually if server is down.
+                warn!("JWT validation call failed (network): {e} — accepting stored JWT optimistically");
+                let mut inner = self.inner.write().await;
+                inner.access_token = Some(token);
+                inner.is_authenticated = true;
+                inner.user = Self::rebuild_user_from_store(username);
+                true
             }
         }
     }
