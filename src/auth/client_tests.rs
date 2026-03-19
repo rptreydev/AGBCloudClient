@@ -61,9 +61,9 @@ fn sadmin_round_trips_correctly() {
 }
 
 #[test]
-fn tech_round_trips_correctly() {
-    let restored = round_trip(&UserRole::TECH).unwrap();
-    assert!(matches!(restored, UserRole::TECH));
+fn viewer_round_trips_correctly() {
+    let restored = round_trip(&UserRole::VIEWER).unwrap();
+    assert!(matches!(restored, UserRole::VIEWER));
 }
 
 // ── Unknown role string → UserRole::Unknown (serde(other) catch-all) ──────────
@@ -116,18 +116,13 @@ fn sadmin_uses_standard_endpoint() {
 }
 
 #[test]
-fn tech_uses_standard_endpoint() {
-    assert!(!is_supervisor_role(Some(&UserRole::TECH)));
+fn viewer_uses_standard_endpoint() {
+    assert!(!is_supervisor_role(Some(&UserRole::VIEWER)));
 }
 
 #[test]
 fn installer_uses_standard_endpoint() {
     assert!(!is_supervisor_role(Some(&UserRole::INSTALLER)));
-}
-
-#[test]
-fn viewer_uses_standard_endpoint() {
-    assert!(!is_supervisor_role(Some(&UserRole::VIEWER)));
 }
 
 #[test]
@@ -159,7 +154,6 @@ fn routing_cases() -> Vec<RoutingCase> {
         RoutingCase { role: Some(UserRole::SUPERVISOR),          expect_filtered: true,  label: "SUPERVISOR" },
         RoutingCase { role: Some(UserRole::ADMIN),               expect_filtered: false, label: "ADMIN" },
         RoutingCase { role: Some(UserRole::SADMIN),              expect_filtered: false, label: "SADMIN" },
-        RoutingCase { role: Some(UserRole::TECH),                expect_filtered: false, label: "TECH" },
         RoutingCase { role: Some(UserRole::INSTALLER),           expect_filtered: false, label: "INSTALLER" },
         RoutingCase { role: Some(UserRole::VIEWER),              expect_filtered: false, label: "VIEWER" },
         RoutingCase { role: Some(UserRole::Unknown),             expect_filtered: false, label: "Unknown" },

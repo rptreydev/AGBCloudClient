@@ -1021,6 +1021,10 @@ pub fn show_download_notification(
     project: Option<&str>,
     location: Option<&str>,
 ) {
+    // Respect the user's mute preference (read from shared IPC file).
+    if crate::sync::progress::read_progress_file().notifications_muted {
+        return;
+    }
     let (icon, label) = match mime {
         Some(m) if m.starts_with("image/") => ("📷", "New photo synced"),
         Some(m) if m.starts_with("video/") => ("🎬", "New video synced"),

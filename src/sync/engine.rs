@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use crate::auth::AuthState;
 use crate::config::AppConfig;
 use crate::models::{CloudFile, FolderSelection};
-use crate::sync::progress::{write_progress_file, SharedProgress, SyncPhase};
+use crate::sync::progress::{write_progress_file, ActivityEntry, SharedProgress, SyncPhase};
 use crate::sync::remote::RemoteClient;
 
 /// Orchestrates sync between local filesystem and remote API.
@@ -292,10 +292,25 @@ impl SyncEngine {
             location,
         ).await;
 
+        // Build the relative folder string for the activity log (e.g. "SHA / Building 3").
+        let rel_folder = path_parts.join(" / ");
+        let size_bytes = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        let timestamp_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         self.update_progress(|p| {
             p.files_done += 1;
             p.files_downloaded += 1;
             p.current_file.clear(); // clear so bar doesn't stay at half-credit after download
+            p.push_activity(ActivityEntry {
+                file_name: file.name.clone(),
+                folder: rel_folder.clone(),
+                action: "Downloaded".to_string(),
+                timestamp_secs,
+                size_bytes,
+            });
         });
         Ok(())
     }

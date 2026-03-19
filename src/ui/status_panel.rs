@@ -28,7 +28,7 @@ struct DirEntry {
 }
 
 #[derive(PartialEq, Clone, Copy)]
-enum BrowserTab { Folders, Files }
+enum BrowserTab { Folders, Files, Activity }
 
 #[derive(PartialEq, Clone, Copy)]
 enum ViewMode { List, Grid, Details }
@@ -401,8 +401,9 @@ impl eframe::App for StatusPanel {
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
                     for (tab, label, icon) in [
-                        (BrowserTab::Folders, "Synced", "☁"),
-                        (BrowserTab::Files,   "Files",  "📂"),
+                        (BrowserTab::Folders,  "Synced",    "☁"),
+                        (BrowserTab::Files,    "Files",     "📂"),
+                        (BrowserTab::Activity, "Activity",  "🕐"),
                     ] {
                         let is_active = self.active_tab == tab;
                         let text_col = if is_active { ACCENT } else { TEXT_SECONDARY };
@@ -574,6 +575,15 @@ impl eframe::App for StatusPanel {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 self.render_folders(ui);
+                            });
+                    }
+                    BrowserTab::Activity => {
+                        egui::ScrollArea::vertical()
+                            .id_salt("sp_activity_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                self.render_activity(ui);
                             });
                     }
                     BrowserTab::Files => {
@@ -1568,6 +1578,125 @@ impl StatusPanel {
         }
 
         navigate_to
+    }
+
+    // ── Activity tab ──────────────────────────────────────────────────────────
+
+    fn render_activity(&self, ui: &mut egui::Ui) {
+        egui::Frame::default()
+            .inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 18.0 })
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                // Header row
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Recent Activity")
+                            .size(11.5)
+                            .color(TEXT_SECONDARY)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{} entries", self.progress.activity_log.len()))
+                                .size(10.5)
+                                .color(TEXT_DISABLED),
+                        );
+                    });
+                });
+                ui.add_space(12.0);
+
+                if self.progress.activity_log.is_empty() {
+                    // Empty state
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(32.0);
+                        ui.label(egui::RichText::new("🕐").size(36.0));
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("No recent activity")
+                                .size(13.0)
+                                .color(TEXT_SECONDARY),
+                        );
+                        ui.label(
+                            egui::RichText::new("Downloaded files will appear here.")
+                                .size(11.0)
+                                .color(TEXT_DISABLED),
+                        );
+                    });
+                    return;
+                }
+
+                for entry in &self.progress.activity_log {
+                    egui::Frame::default()
+                        .fill(CARD_BG)
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 8.0 })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                // File type icon
+                                let (col, icon) = file_type_meta(&entry.file_name);
+                                ui.label(egui::RichText::new(&icon).size(18.0).color(col));
+                                ui.add_space(6.0);
+
+                                ui.vertical(|ui| {
+                                    // File name + action badge on the same row
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(truncate_name(&entry.file_name, 32))
+                                                .size(12.0)
+                                                .color(TEXT_PRIMARY)
+                                                .strong(),
+                                        );
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(
+                                                egui::RichText::new(&entry.action)
+                                                    .size(10.0)
+                                                    .color(SUCCESS_COLOR),
+                                            );
+                                        });
+                                    });
+
+                                    // Folder path + size + time-ago
+                                    ui.horizontal(|ui| {
+                                        if !entry.folder.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(path_truncate(&entry.folder, 28))
+                                                    .size(10.5)
+                                                    .color(TEXT_SECONDARY),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("·")
+                                                    .size(10.5)
+                                                    .color(TEXT_DISABLED),
+                                            );
+                                        }
+                                        if entry.size_bytes > 0 {
+                                            ui.label(
+                                                egui::RichText::new(format_size(entry.size_bytes))
+                                                    .size(10.5)
+                                                    .color(TEXT_SECONDARY),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new("·")
+                                                    .size(10.5)
+                                                    .color(TEXT_DISABLED),
+                                            );
+                                        }
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(
+                                                egui::RichText::new(format_modified(entry.timestamp_secs))
+                                                    .size(10.5)
+                                                    .color(TEXT_DISABLED),
+                                            );
+                                        });
+                                    });
+                                });
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+            });
     }
 }
 

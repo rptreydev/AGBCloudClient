@@ -62,27 +62,36 @@ fn count_running_instances() -> u32 { 1 }
 
 /// IDs of the context menu items (stored so we can match events).
 struct MenuIds {
-    status:  tray_icon::menu::MenuId,
-    folders: tray_icon::menu::MenuId,
-    settings: tray_icon::menu::MenuId,
-    logout:  tray_icon::menu::MenuId,
-    quit:    tray_icon::menu::MenuId,
+    status:       tray_icon::menu::MenuId,
+    folders:      tray_icon::menu::MenuId,
+    settings:     tray_icon::menu::MenuId,
+    mute_notifs:  tray_icon::menu::MenuId,
+    logout:       tray_icon::menu::MenuId,
+    quit:         tray_icon::menu::MenuId,
 }
 
-/// Build the right-click context menu and return it with the item IDs.
-fn build_context_menu() -> (Menu, MenuIds) {
+/// Build the right-click context menu.
+///
+/// `muted` controls the label of the notification toggle item so the user
+/// always sees the action they can take ("Mute" vs "Unmute").
+/// The menu is rebuilt on every right-click so the label stays in sync
+/// without needing a mutable menu-item reference.
+fn build_context_menu(muted: bool) -> (Menu, MenuIds) {
     let status_item   = MenuItem::new("Open Status Panel",  true, None);
     let folders_item  = MenuItem::new("Manage Folders...",  true, None);
     let settings_item = MenuItem::new("Settings...",        true, None);
+    let mute_label    = if muted { "🔕  Unmute Notifications" } else { "🔔  Mute Notifications" };
+    let mute_item     = MenuItem::new(mute_label,           true, None);
     let logout_item   = MenuItem::new("Sign Out",           true, None);
     let quit_item     = MenuItem::new("Quit",               true, None);
 
     let ids = MenuIds {
-        status:   status_item.id().clone(),
-        folders:  folders_item.id().clone(),
-        settings: settings_item.id().clone(),
-        logout:   logout_item.id().clone(),
-        quit:     quit_item.id().clone(),
+        status:      status_item.id().clone(),
+        folders:     folders_item.id().clone(),
+        settings:    settings_item.id().clone(),
+        mute_notifs: mute_item.id().clone(),
+        logout:      logout_item.id().clone(),
+        quit:        quit_item.id().clone(),
     };
 
     let menu = Menu::new();
@@ -90,6 +99,8 @@ fn build_context_menu() -> (Menu, MenuIds) {
         &status_item,
         &folders_item,
         &settings_item,
+        &PredefinedMenuItem::separator(),
+        &mute_item,
         &PredefinedMenuItem::separator(),
         &logout_item,
         &PredefinedMenuItem::separator(),
@@ -152,7 +163,10 @@ pub fn run_tray(
 
     let mut is_auth = rt.block_on(auth.is_authenticated());
 
-    let (menu, menu_ids) = build_context_menu();
+    // menu_ids is rebuilt on every right-click (so the mute/unmute label stays fresh).
+    // We initialise it here only to give it a definite type; the actual IDs used for
+    // event matching come from the most-recently-built menu.
+    let (_, mut menu_ids) = build_context_menu(false);
 
     // ── Ghost icon cleanup ────────────────────────────────────────────────────
     // When a tray process is force-killed (Ctrl+C, taskkill /F, power loss),
@@ -352,6 +366,12 @@ pub fn run_tray(
                         button_state: MouseButtonState::Up,
                         ..
                     } => {
+                        // Rebuild the menu on every right-click so the mute/unmute label
+                        // always reflects the current state without a mutable item reference.
+                        let muted = read_progress_file().notifications_muted;
+                        let (fresh_menu, fresh_ids) = build_context_menu(muted);
+                        menu_ids = fresh_ids;
+
                         // Show context menu manually on right-click only.
                         // We create a tiny invisible WS_POPUP window on this thread so
                         // that TrackPopupMenu (inside show_context_menu_for_hwnd) has a
@@ -380,7 +400,7 @@ pub fn run_tray(
                                 SetForegroundWindow(hwnd);
                                 // show_context_menu_for_hwnd blocks until the menu is dismissed,
                                 // then queues a MenuEvent which we pick up below.
-                                menu.show_context_menu_for_hwnd(hwnd as isize, None);
+                                fresh_menu.show_context_menu_for_hwnd(hwnd as isize, None);
                                 DestroyWindow(hwnd);
                             }
                         }
@@ -401,6 +421,12 @@ pub fn run_tray(
                 } else if event.id == menu_ids.settings {
                     info!("Menu: Settings");
                     spawn_ui_subprocess("--settings", &children);
+                } else if event.id == menu_ids.mute_notifs {
+                    let mut prog = read_progress_file();
+                    prog.notifications_muted = !prog.notifications_muted;
+                    let state = if prog.notifications_muted { "muted" } else { "unmuted" };
+                    info!("Notifications {state}");
+                    write_progress_file(&prog);
                 } else if event.id == menu_ids.logout && is_auth {
                     info!("Menu: Sign Out");
                     let _ = rt.block_on(auth_clone.logout());
