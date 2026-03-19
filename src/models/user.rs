@@ -25,7 +25,6 @@ pub struct User {
 pub enum UserRole {
     SADMIN,
     ADMIN,
-    TECH,
     SUPERVISOR,
     COMPANY_SUPERVISOR,
     INSTALLER,
