@@ -930,6 +930,10 @@ impl eframe::App for WizardWrapper {
                 cfg.selected_folders = self.inner.build_selections();
                 cfg.auto_start = self.inner.start_with_windows;
                 cfg.setup_complete = true;
+                // Flag for the tray to register this as a genuine first install
+                // (not a restart). If the user had cancelled, the uninstaller would
+                // clean up and the flag would never be read.
+                crate::update::write_first_install_flag();
                 if let Err(e) = cfg.save() {
                     error!("Failed to save config: {e}");
                 } else {

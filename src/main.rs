@@ -512,10 +512,12 @@ fn main() {
         });
     }
 
-    // ── Register this installation on startup ─────────────────────────────────
-    // Fire-and-forget: keeps AppClientStatus up-to-date on the server
-    // (current version, machine name, last-seen timestamp).
-    {
+    // ── Register first install ────────────────────────────────────────────────
+    // Only fires once — on the first tray startup after the wizard Finish step.
+    // The wizard writes the flag; cancelling the wizard triggers the uninstaller
+    // so the flag is never read. Subsequent restarts are not re-registered.
+    if update::take_first_install_flag() {
+        info!("First install detected — registering INSTALLED event");
         let http = auth_state.client().clone();
         let server_url = config.server_url.clone();
         let jwt = rt.block_on(auth_state.get_token()).unwrap_or_default();

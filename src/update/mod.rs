@@ -292,6 +292,34 @@ pub fn take_just_updated_flag() -> Option<(String, String)> {
     }
 }
 
+// ── First-install flag ────────────────────────────────────────────────────────
+//
+// Written by the wizard on Finish so the tray startup can report a genuine
+// INSTALLED event (not just a re-launch). Prevents false registrations when
+// the user cancels the wizard and the uninstaller removes everything.
+
+/// Path of the first-install flag file (`%TEMP%\agb_first_install.flag`).
+pub fn first_install_flag_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("agb_first_install.flag")
+}
+
+/// Write the flag. Called from the wizard Finish block.
+pub fn write_first_install_flag() {
+    let _ = std::fs::write(first_install_flag_path(), env!("CARGO_PKG_VERSION"));
+}
+
+/// Read and immediately delete the flag.
+/// Returns `true` if this is the first tray startup after a fresh install.
+pub fn take_first_install_flag() -> bool {
+    let path = first_install_flag_path();
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+        true
+    } else {
+        false
+    }
+}
+
 // ── Update toast notifications ────────────────────────────────────────────────
 
 fn toast(summary: &str, body: &str, timeout_ms: u32) {
