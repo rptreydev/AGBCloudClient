@@ -70,7 +70,6 @@ pub fn show_status_panel(auth: &AuthState, rt: &tokio::runtime::Runtime) {
         .map(|r| match r {
             UserRole::SADMIN => "Super Admin",
             UserRole::ADMIN => "Administrator",
-            UserRole::TECH => "Technician",
             UserRole::SUPERVISOR => "Supervisor",
             UserRole::COMPANY_SUPERVISOR => "Company Supervisor",
             UserRole::INSTALLER => "Installer",
