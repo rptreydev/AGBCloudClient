@@ -252,6 +252,41 @@ fn main() {
         ui::common::remove_desktop_shortcut().ok();
         ui::common::set_auto_start(false).ok();
 
+        // ── Report UNINSTALLED event BEFORE clearing credentials ──────────────
+        // Restore session first so we have a valid JWT, then fire the event.
+        // Use a small dedicated runtime — the main one hasn't been created yet.
+        // Short timeout (5 s) so uninstall never hangs even if server is down.
+        {
+            let uninstall_rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = uninstall_rt {
+                let auth_tmp = auth::AuthState::new(config.clone());
+                let restored = rt.block_on(auth_tmp.try_restore_session());
+                if restored {
+                    if let Some(jwt) = rt.block_on(auth_tmp.get_token()) {
+                        rt.block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                update::register_client_event(
+                                    &config.server_url,
+                                    &jwt,
+                                    update::ClientEventType::Uninstalled,
+                                    env!("CARGO_PKG_VERSION"),
+                                    None,
+                                    auth_tmp.client(),
+                                ),
+                            )
+                            .await
+                            .ok();
+                        });
+                    }
+                } else {
+                    info!("Uninstall: no active session — skipping UNINSTALLED event");
+                }
+            }
+        }
+
         // Delete all credentials from Windows Credential Manager so no tokens remain
         // after uninstall.  clear_all() deletes JWT, refresh token, password, and
         // the last-username entry.  Errors are non-fatal — NSIS removes the files
