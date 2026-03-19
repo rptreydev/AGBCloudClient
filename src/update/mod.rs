@@ -138,17 +138,20 @@ pub fn is_newer_version(remote_version: &str) -> bool {
 ///   - `url` is empty (endpoint not yet configured)
 ///   - Server is unreachable
 ///   - Version is the same or older
-pub async fn check_for_update(url: &str, http: &reqwest::Client) -> Option<UpdateInfo> {
+///
+/// `jwt` is sent as a `Cookie: jwt=<token>` header so the backend's
+/// JwtAuthGuard can authenticate the request even when the reqwest cookie
+/// jar has not been populated yet (e.g. JWT-fallback session restore path).
+pub async fn check_for_update(url: &str, jwt: &str, http: &reqwest::Client) -> Option<UpdateInfo> {
     if url.is_empty() {
         return None; // Endpoint not configured yet — skip silently.
     }
     info!("Checking for updates at {url}");
-    let resp = match http
-        .get(url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-    {
+    let mut req = http.get(url).timeout(std::time::Duration::from_secs(10));
+    if !jwt.is_empty() {
+        req = req.header("Cookie", format!("jwt={jwt}"));
+    }
+    let resp = match req.send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             warn!("Update check: HTTP {}", r.status());

@@ -516,7 +516,8 @@ fn main() {
         };
         let pending = read_update_flag().or_else(|| {
             let http = auth_state.client();
-            rt.block_on(check_for_update(&check_url, http))
+            let jwt = rt.block_on(auth_state.get_token()).unwrap_or_default();
+            rt.block_on(check_for_update(&check_url, &jwt, http))
         });
         if let Some(info) = pending {
             write_update_flag(&info);
